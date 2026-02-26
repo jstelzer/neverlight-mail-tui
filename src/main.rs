@@ -1,5 +1,6 @@
 mod app;
 mod compose;
+mod threading;
 mod ui;
 
 use std::io;

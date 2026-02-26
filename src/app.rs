@@ -286,31 +286,10 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn recompute_visible(&mut self) {
-        // Build thread sizes
-        self.thread_sizes.clear();
-        for msg in &self.messages {
-            if let Some(tid) = msg.thread_id {
-                *self.thread_sizes.entry(tid).or_insert(0) += 1;
-            }
-        }
-
-        // Build visible indices: show all roots + children of non-collapsed threads
-        self.visible_indices.clear();
-        for (i, msg) in self.messages.iter().enumerate() {
-            let dominated = msg.thread_depth > 0;
-            if !dominated {
-                // Root or standalone — always visible
-                self.visible_indices.push(i);
-            } else if let Some(tid) = msg.thread_id {
-                // Child — visible only if thread is not collapsed
-                if !self.collapsed_threads.contains(&tid) {
-                    self.visible_indices.push(i);
-                }
-            } else {
-                // No thread_id but has depth — show anyway
-                self.visible_indices.push(i);
-            }
-        }
+        let (sizes, visible) =
+            crate::threading::compute_visible(&self.messages, &self.collapsed_threads);
+        self.thread_sizes = sizes;
+        self.visible_indices = visible;
     }
 
     fn toggle_thread_collapse(&mut self) {
@@ -1149,26 +1128,12 @@ impl App {
 
     /// Navigate messages using visible_indices when threading is active.
     fn visible_nav(&self, direction: i32) -> Option<usize> {
-        if self.visible_indices.is_empty() {
-            // No threading — simple navigation
-            let new = self.selected_message as i32 + direction;
-            if new >= 0 && (new as usize) < self.messages.len() {
-                return Some(new as usize);
-            }
-            return None;
-        }
-        // Find current position in visible_indices
-        let cur_pos = self
-            .visible_indices
-            .iter()
-            .position(|&i| i == self.selected_message)
-            .unwrap_or(0);
-        let new_pos = cur_pos as i32 + direction;
-        if new_pos >= 0 && (new_pos as usize) < self.visible_indices.len() {
-            Some(self.visible_indices[new_pos as usize])
-        } else {
-            None
-        }
+        crate::threading::visible_nav(
+            &self.visible_indices,
+            self.messages.len(),
+            self.selected_message,
+            direction,
+        )
     }
 
     fn move_up(&mut self) {

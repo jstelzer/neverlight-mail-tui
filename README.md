@@ -4,9 +4,9 @@ Terminal email client powered by [nevermail-core](https://github.com/neverlight/
 
 Shares the same email engine, config files, and credential resolution as [nevermail](https://github.com/neverlight/nevermail) (COSMIC desktop client).
 
-![Message list](screenshots/message-list.png)
-![Inline image rendering](screenshots/inline-image.png)
 ![Compose overlay](screenshots/compose.png)
+![Inline image rendering](screenshots/inline-image.png)
+![Message list](screenshots/message-list.png)
 
 ## Features
 

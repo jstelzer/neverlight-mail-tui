@@ -74,3 +74,46 @@ pub fn build_references(in_reply_to: Option<&str>, message_id: &str) -> String {
         None => message_id.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_body_prefixes_lines() {
+        let result = quote_body("line 1\nline 2", "Alice", "2026-01-15");
+        assert_eq!(
+            result,
+            "On 2026-01-15, Alice wrote:\n> line 1\n> line 2\n"
+        );
+    }
+
+    #[test]
+    fn quote_body_empty() {
+        let result = quote_body("", "Bob", "2026-02-01");
+        // Empty string has zero lines, so no "> " prefix — just the header
+        assert_eq!(result, "On 2026-02-01, Bob wrote:\n\n");
+    }
+
+    #[test]
+    fn forward_body_includes_header_block() {
+        let result = forward_body("Hello world", "Alice", "2026-01-15", "Test Subject");
+        assert!(result.starts_with("---------- Forwarded message ----------\n"));
+        assert!(result.contains("From: Alice\n"));
+        assert!(result.contains("Date: 2026-01-15\n"));
+        assert!(result.contains("Subject: Test Subject\n"));
+        assert!(result.contains("Hello world\n"));
+    }
+
+    #[test]
+    fn build_references_with_in_reply_to() {
+        let result = build_references(Some("<abc@example.com>"), "<def@example.com>");
+        assert_eq!(result, "<abc@example.com> <def@example.com>");
+    }
+
+    #[test]
+    fn build_references_without_in_reply_to() {
+        let result = build_references(None, "<def@example.com>");
+        assert_eq!(result, "<def@example.com>");
+    }
+}
