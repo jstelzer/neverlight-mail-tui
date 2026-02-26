@@ -1,10 +1,11 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui_image::StatefulImage;
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, LayoutRects};
 use crate::compose::ComposeField;
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -22,6 +23,13 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Percentage(50),
         ])
         .split(main_area);
+
+    // Save layout rects for mouse hit-testing
+    app.layout_rects = LayoutRects {
+        folders: columns[0],
+        messages: columns[1],
+        body: columns[2],
+    };
 
     render_folders(frame, app, columns[0]);
     render_messages(frame, app, columns[1]);
@@ -144,7 +152,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_body(frame: &mut Frame, app: &App, area: Rect) {
+fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     let text = app
         .body_text
         .as_deref()
@@ -156,17 +164,64 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .title(" Preview ")
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.body_scroll, 0));
+    let has_image = app.image_proto.is_some();
+    let has_attachments = !app.attachment_info.is_empty();
 
-    frame.render_widget(paragraph, area);
+    // Build title with attachment info
+    let title = if has_attachments {
+        let total = app.attachment_info.len();
+        let img_count = app.attachment_info.iter().filter(|(_, m, _)| m.starts_with("image/")).count();
+        if img_count > 0 {
+            format!(" Preview [{total} attachments, {img_count} images] ")
+        } else {
+            format!(" Preview [{total} attachments] ")
+        }
+    } else {
+        " Preview ".to_string()
+    };
+
+    if has_image {
+        // Split: text top (60%), image bottom (40%)
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        // Text section
+        let paragraph = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(title.as_str())
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.body_scroll, 0));
+        frame.render_widget(paragraph, sections[0]);
+
+        // Image section
+        let img_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style);
+        let img_inner = img_block.inner(sections[1]);
+        frame.render_widget(img_block, sections[1]);
+
+        if let Some(proto) = &mut app.image_proto {
+            frame.render_stateful_widget(StatefulImage::default(), img_inner, proto);
+        }
+    } else {
+        // No images — full text preview
+        let paragraph = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(title.as_str())
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.body_scroll, 0));
+        frame.render_widget(paragraph, area);
+    }
 }
 
 fn render_compose(frame: &mut Frame, app: &App, area: Rect) {

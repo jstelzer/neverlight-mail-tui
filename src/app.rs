@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use ratatui::prelude::Rect;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use nevermail_core::config::{AccountConfig, Config};
 use nevermail_core::imap::ImapSession;
-use nevermail_core::models::{Folder, MessageSummary};
+use nevermail_core::models::{AttachmentData, Folder, MessageSummary};
 use nevermail_core::store::{self, CacheHandle};
 use nevermail_core::{EnvelopeHash, FlagOp, MailboxHash, RefreshEventKind};
+use ratatui_image::picker::Picker;
+use ratatui_image::thread::{ResizeRequest, ThreadProtocol};
 
 use crate::compose::{self, ComposeField, ComposeMode, ComposeState};
 
@@ -26,7 +29,7 @@ pub enum BgResult {
     },
     Body {
         message_idx: usize,
-        result: Result<String, String>,
+        result: Result<(String, Vec<AttachmentData>), String>,
     },
     /// Cached messages arrived (show immediately, IMAP fetch may follow)
     CachedMessages {
@@ -116,8 +119,27 @@ pub struct App {
     pub visible_indices: Vec<usize>,
     /// Number of messages per thread_id
     pub thread_sizes: HashMap<u64, usize>,
-    bg_rx: mpsc::UnboundedReceiver<BgResult>,
+    pub bg_rx: mpsc::UnboundedReceiver<BgResult>,
     bg_tx: mpsc::UnboundedSender<BgResult>,
+    /// Layout rects set by ui::render each frame, used for mouse hit-testing.
+    pub layout_rects: LayoutRects,
+    /// Terminal image protocol picker (sixel/kitty/halfblocks).
+    picker: Option<Picker>,
+    /// Image protocol for the first inline image in the current message body.
+    pub image_proto: Option<ThreadProtocol>,
+    /// Channel for image resize requests from ThreadProtocol.
+    pub img_resize_rx: mpsc::UnboundedReceiver<ResizeRequest>,
+    img_resize_tx: mpsc::UnboundedSender<ResizeRequest>,
+    /// Attachment summary for the current message (filename, mime_type, size).
+    pub attachment_info: Vec<(String, String, usize)>,
+}
+
+/// Cached layout geometry for mouse hit-testing.
+#[derive(Default, Clone)]
+pub struct LayoutRects {
+    pub folders: Rect,
+    pub messages: Rect,
+    pub body: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +186,7 @@ impl App {
 
         let cache = CacheHandle::open().map_err(|e| anyhow::anyhow!("{e}"))?;
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        let (img_tx, img_rx) = mpsc::unbounded_channel();
 
         let mut account_states = Vec::new();
         for config in configs {
@@ -196,6 +219,12 @@ impl App {
             thread_sizes: HashMap::new(),
             bg_rx,
             bg_tx,
+            layout_rects: LayoutRects::default(),
+            picker: None,
+            image_proto: None,
+            img_resize_rx: img_rx,
+            img_resize_tx: img_tx,
+            attachment_info: Vec::new(),
         };
 
         app.spawn_load_folders();
@@ -319,9 +348,17 @@ impl App {
     // Channel interface (called from main loop)
     // -----------------------------------------------------------------------
 
-    /// Receive the next background result, if any.
-    pub async fn recv(&mut self) -> Option<BgResult> {
-        self.bg_rx.recv().await
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.picker = Some(picker);
+    }
+
+    /// Apply a completed image resize (from ThreadProtocol background work).
+    pub fn apply_image_resize(&mut self, request: ResizeRequest) {
+        if let Ok(resized) = request.resize_encode() {
+            if let Some(proto) = &mut self.image_proto {
+                proto.update_resized_protocol(resized);
+            }
+        }
     }
 
     /// Apply a background result to app state.
@@ -386,15 +423,38 @@ impl App {
                     return;
                 }
                 match result {
-                    Ok(body) => {
+                    Ok((body, attachments)) => {
                         self.body_text = Some(body);
                         self.body_scroll = 0;
+                        // Build attachment summary
+                        self.attachment_info = attachments
+                            .iter()
+                            .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.len()))
+                            .collect();
+                        // Create image protocol for the first image attachment
+                        self.image_proto = None;
+                        if let Some(picker) = &self.picker {
+                            for att in &attachments {
+                                if att.is_image() {
+                                    if let Ok(img) = image::load_from_memory(&att.data) {
+                                        let proto = picker.new_resize_protocol(img);
+                                        self.image_proto = Some(ThreadProtocol::new(
+                                            self.img_resize_tx.clone(),
+                                            Some(proto),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         if let Some(msg) = self.messages.get(message_idx) {
                             self.status = msg.subject.clone();
                         }
                     }
                     Err(e) => {
                         self.body_text = Some(format!("Error: {e}"));
+                        self.attachment_info.clear();
+                        self.image_proto = None;
                         self.status = format!("Body error: {e}");
                     }
                 }
@@ -586,7 +646,7 @@ impl App {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             // Try cache first
-            if let Ok(Some((md_body, plain_body, _attachments))) =
+            if let Ok(Some((md_body, plain_body, attachments))) =
                 cache.load_body(env_hash_raw).await
             {
                 let body = if !plain_body.is_empty() {
@@ -596,7 +656,7 @@ impl App {
                 };
                 let _ = tx.send(BgResult::Body {
                     message_idx,
-                    result: Ok(body),
+                    result: Ok((body, attachments)),
                 });
                 return;
             }
@@ -619,12 +679,13 @@ impl App {
                     );
                     // Save to cache (fire-and-forget)
                     let cache2 = cache.clone();
+                    let att_clone = attachments.clone();
                     tokio::spawn(async move {
                         let _ = cache2
-                            .save_body(env_hash_raw, text_plain, text_html, attachments)
+                            .save_body(env_hash_raw, text_plain, text_html, att_clone)
                             .await;
                     });
-                    rendered
+                    (rendered, attachments)
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(BgResult::Body {
@@ -871,7 +932,7 @@ impl App {
                     ));
                     if let Some(body) = &self.body_text {
                         let quoted = compose::quote_body(body, &msg.from, &msg.date);
-                        state.body = tui_textarea::TextArea::new(
+                        state.body = ratatui_textarea::TextArea::new(
                             std::iter::once(String::new())
                                 .chain(std::iter::once(String::new()))
                                 .chain(quoted.lines().map(String::from))
@@ -891,7 +952,7 @@ impl App {
                     if let Some(body) = &self.body_text {
                         let fwd =
                             compose::forward_body(body, &msg.from, &msg.date, &msg.subject);
-                        state.body = tui_textarea::TextArea::new(
+                        state.body = ratatui_textarea::TextArea::new(
                             std::iter::once(String::new())
                                 .chain(std::iter::once(String::new()))
                                 .chain(fwd.lines().map(String::from))
@@ -983,7 +1044,7 @@ impl App {
                         _ => {}
                     },
                     ComposeField::Body => {
-                        // Forward full KeyEvent to tui-textarea
+                        // Forward full KeyEvent to textarea
                         state.body.input(key);
                     }
                 }
@@ -1069,6 +1130,8 @@ impl App {
                 } else {
                     self.status = format!("Searching: {}…", self.search_query);
                     self.spawn_search();
+                    // Exit search input mode so user can navigate results
+                    self.search_active = false;
                 }
             }
             KeyCode::Backspace => {
@@ -1151,6 +1214,87 @@ impl App {
             Focus::Folders => self.spawn_load_messages(),
             Focus::Messages => self.spawn_load_body(),
             Focus::Body => {}
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Mouse handling
+    // -------------------------------------------------------------------
+
+    pub fn handle_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) {
+        if self.compose.is_some() || self.search_active {
+            return;
+        }
+
+        let lr = &self.layout_rects;
+        let in_rect = |r: &Rect| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        };
+
+        match kind {
+            MouseEventKind::Down(_) => {
+                if in_rect(&lr.folders.clone()) {
+                    self.focus = Focus::Folders;
+                    // Row within the pane (subtract border top)
+                    let local_row = row.saturating_sub(lr.folders.y + 1) as usize;
+                    if local_row < self.active().folders.len()
+                        && local_row != self.selected_folder
+                    {
+                        self.selected_folder = local_row;
+                        self.spawn_load_messages();
+                    }
+                } else if in_rect(&lr.messages.clone()) {
+                    self.focus = Focus::Messages;
+                    let local_row = row.saturating_sub(lr.messages.y + 1) as usize;
+                    // Map visible row to actual message index
+                    let vis = if self.visible_indices.is_empty() {
+                        if local_row < self.messages.len() {
+                            Some(local_row)
+                        } else {
+                            None
+                        }
+                    } else if local_row < self.visible_indices.len() {
+                        Some(self.visible_indices[local_row])
+                    } else {
+                        None
+                    };
+                    if let Some(idx) = vis {
+                        self.selected_message = idx;
+                        self.spawn_load_body();
+                    }
+                } else if in_rect(&lr.body.clone()) {
+                    self.focus = Focus::Body;
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if in_rect(&lr.body.clone()) {
+                    self.body_scroll = self.body_scroll.saturating_sub(3);
+                } else if in_rect(&lr.folders.clone()) {
+                    if self.selected_folder > 0 {
+                        self.selected_folder -= 1;
+                        self.spawn_load_messages();
+                    }
+                } else if in_rect(&lr.messages.clone()) {
+                    if let Some(idx) = self.visible_nav(-1) {
+                        self.selected_message = idx;
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if in_rect(&lr.body.clone()) {
+                    self.body_scroll = self.body_scroll.saturating_add(3);
+                } else if in_rect(&lr.folders.clone()) {
+                    if self.selected_folder + 1 < self.active().folders.len() {
+                        self.selected_folder += 1;
+                        self.spawn_load_messages();
+                    }
+                } else if in_rect(&lr.messages.clone()) {
+                    if let Some(idx) = self.visible_nav(1) {
+                        self.selected_message = idx;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

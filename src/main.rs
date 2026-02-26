@@ -9,6 +9,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use ratatui::prelude::*;
+use ratatui_image::picker::Picker;
 
 use app::{App, AppEvent};
 
@@ -21,12 +22,20 @@ async fn main() -> anyhow::Result<()> {
     // Terminal setup
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(crossterm::event::EnableMouseCapture)?;
+
+    // Detect terminal image protocol (sixel/kitty/iterm2/halfblocks).
+    // Must happen AFTER alternate screen, BEFORE EventStream.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    app.set_picker(picker);
+
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, &mut app).await;
 
     // Terminal restore (always, even on error)
+    io::stdout().execute(crossterm::event::DisableMouseCapture)?;
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
@@ -52,13 +61,20 @@ async fn run(
                             AppEvent::Quit => break,
                         }
                     }
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+                    }
                     Some(Err(_)) => break,
                     _ => {}
                 }
             }
             // Background task results — IMAP fetches land here
-            Some(result) = app.recv() => {
+            Some(result) = app.bg_rx.recv() => {
                 app.apply(result);
+            }
+            // Image resize requests from ThreadProtocol
+            Some(request) = app.img_resize_rx.recv() => {
+                app.apply_image_resize(request);
             }
         }
     }

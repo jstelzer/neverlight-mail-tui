@@ -6,7 +6,13 @@
       "Bash(cargo clippy:*)",
       "Bash(cargo search:*)",
       "WebFetch(domain:crates.io)",
-      "Bash(cargo add:*)"
+      "Bash(cargo add:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(cargo build:*)"
     ]
   }
 }

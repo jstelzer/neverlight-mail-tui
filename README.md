@@ -4,9 +4,15 @@ Terminal email client powered by [nevermail-core](https://github.com/neverlight/
 
 Shares the same email engine, config files, and credential resolution as [nevermail](https://github.com/neverlight/nevermail) (COSMIC desktop client).
 
+![Message list](screenshots/message-list.png)
+![Inline image rendering](screenshots/inline-image.png)
+![Compose overlay](screenshots/compose.png)
+
 ## Features
 
 - Three-pane layout (folders, messages, body preview)
+- Mouse support (click to select, scroll wheel navigation)
+- Inline image rendering (Sixel, Kitty, iTerm2, halfblocks fallback)
 - Multi-account support with instant switching
 - SQLite cache for offline reading and instant startup
 - IMAP IDLE for live mailbox updates
@@ -44,6 +50,13 @@ Multiple accounts are supported. All accounts from config resolution are connect
 | `k` / `↑`           | Move up (scroll body when focused)     |
 | `Enter`             | Open (load messages / view body)       |
 | `q`                 | Quit                                   |
+
+### Mouse
+
+| Action       | Effect                                    |
+|--------------|-------------------------------------------|
+| Click        | Select folder/message, focus pane          |
+| Scroll wheel | Navigate folders/messages, scroll body     |
 
 ### Message Actions
 
@@ -85,13 +98,14 @@ Multiple accounts are supported. All accounts from config resolution are connect
 
 ```
 ┌──────────┬───────────────────┬────────────────────────┐
-│ Folders  │ Messages          │ Preview                │
+│ Folders  │ Messages          │ Preview [2 att, 1 img] │
 │          │                   │                        │
 │ INBOX(3) │ ● ★ From — Subj  │ Message body text...   │
 │ Sent     │   [-3] From — Re: │                        │
-│ Drafts   │     From — Re:   │                        │
-│ Trash    │     From — Re:   │                        │
-│ Archive  │   From — Subj    │                        │
+│ Drafts   │     From — Re:   ├────────────────────────┤
+│ Trash    │     From — Re:   │ ┌────────────────────┐ │
+│ Archive  │   From — Subj    │ │  (inline image)    │ │
+│          │                   │ └────────────────────┘ │
 └──────────┴───────────────────┴────────────────────────┘
  Status bar / Search: query_
 ```
@@ -112,16 +126,18 @@ Cache provides instant display of previously-seen folders, messages, and bodies 
 
 ## Dependencies
 
-| Crate            | Purpose                                               |
-|------------------|-------------------------------------------------------|
-| nevermail-core   | Email engine (IMAP, SMTP, MIME, cache, config)        |
-| ratatui          | TUI framework                                         |
-| crossterm        | Terminal backend (raw mode, alternate screen, events) |
-| tui-textarea     | Multiline text editor for compose                     |
-| tokio            | Async runtime                                         |
-| futures          | Stream utilities (IMAP IDLE)                          |
-| anyhow           | Error handling                                        |
-| log / env_logger | `RUST_LOG` logging                                    |
+| Crate              | Purpose                                               |
+|--------------------|-------------------------------------------------------|
+| nevermail-core     | Email engine (IMAP, SMTP, MIME, cache, config)        |
+| ratatui            | TUI framework                                         |
+| crossterm          | Terminal backend (raw mode, alternate screen, events) |
+| ratatui-textarea   | Multiline text editor for compose                     |
+| ratatui-image      | Inline image rendering (Sixel, Kitty, iTerm2, halfblocks) |
+| image              | Image decoding (PNG, JPEG, GIF, etc.)                 |
+| tokio              | Async runtime                                         |
+| futures            | Stream utilities (IMAP IDLE)                          |
+| anyhow             | Error handling                                        |
+| log / env_logger   | `RUST_LOG` logging                                    |
 
 ## Related
 
