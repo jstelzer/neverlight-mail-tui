@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Terminal email client powered by nevermail-core"
-repository = "https://github.com/neverlight/nevermail-tui"
+repository = "https://github.com/jstelzer/nevermail-tui"
 
 [dependencies]
 # Email engine
