@@ -21,13 +21,13 @@ Or use a `~/.config/nevermail/config.json` file — see [nevermail-core](https:/
 
 ## Keybindings
 
-| Key | Action |
-|-----|--------|
+| Key                 | Action                                 |
+|---------------------|----------------------------------------|
 | `Tab` / `Shift-Tab` | Cycle focus: Folders → Messages → Body |
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `Enter` | Open (load messages / view body) |
-| `q` | Quit |
+| `j` / `↓`           | Move down                              |
+| `k` / `↑`           | Move up                                |
+| `Enter`             | Open (load messages / view body)       |
+| `q`                 | Quit                                   |
 
 ## Layout
 
