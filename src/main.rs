@@ -1,4 +1,5 @@
 mod app;
+mod compose;
 mod ui;
 
 use std::io;
@@ -46,7 +47,7 @@ async fn run(
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        match app.handle_key(key.code) {
+                        match app.handle_key(key) {
                             AppEvent::Continue => {}
                             AppEvent::Quit => break,
                         }
