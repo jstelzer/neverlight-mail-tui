@@ -3,9 +3,10 @@ mod ui;
 
 use std::io;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use futures::StreamExt;
 use ratatui::prelude::*;
 
 use app::{App, AppEvent};
@@ -31,25 +32,34 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> anyhow::Result<()> {
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    let mut reader = EventStream::new();
+
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        // Poll for keyboard events with a timeout so async tasks can progress
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match app.handle_key(key.code).await {
-                    AppEvent::Continue => {}
-                    AppEvent::Quit => break,
+        tokio::select! {
+            // Input events — wake immediately on keypress
+            maybe_event = reader.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        match app.handle_key(key.code) {
+                            AppEvent::Continue => {}
+                            AppEvent::Quit => break,
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
                 }
             }
+            // Background task results — IMAP fetches land here
+            Some(result) = app.recv() => {
+                app.apply(result);
+            }
         }
-
-        // Drive any pending async work
-        app.tick().await;
     }
     Ok(())
 }
