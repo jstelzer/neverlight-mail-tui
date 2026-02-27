@@ -620,11 +620,12 @@ impl App {
             None => return,
         };
         let cache = self.cache.clone();
+        let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             // Try cache first
             if let Ok(Some((md_body, plain_body, attachments))) =
-                cache.load_body(env_hash_raw).await
+                cache.load_body(account_id.clone(), env_hash_raw).await
             {
                 let body = if !plain_body.is_empty() {
                     plain_body
@@ -656,10 +657,11 @@ impl App {
                     );
                     // Save to cache (fire-and-forget)
                     let cache2 = cache.clone();
+                    let account_id2 = account_id.clone();
                     let att_clone = attachments.clone();
                     tokio::spawn(async move {
                         let _ = cache2
-                            .save_body(env_hash_raw, text_plain, text_html, att_clone)
+                            .save_body(account_id2, env_hash_raw, text_plain, text_html, att_clone)
                             .await;
                     });
                     (rendered, attachments)
@@ -701,13 +703,14 @@ impl App {
             None => return,
         };
         let cache = self.cache.clone();
+        let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             // Update cache optimistically
             let flags = store::flags_to_u8(new_read, was_starred);
             let op = if new_read { "mark-read" } else { "mark-unread" };
             let _ = cache
-                .update_flags(envelope_hash, flags, op.to_string())
+                .update_flags(account_id.clone(), envelope_hash, flags, op.to_string())
                 .await;
 
             // IMAP sync
@@ -720,9 +723,13 @@ impl App {
                 .await;
 
             if result.is_ok() {
-                let _ = cache.clear_pending_op(envelope_hash, flags).await;
+                let _ = cache
+                    .clear_pending_op(account_id.clone(), envelope_hash, flags)
+                    .await;
             } else {
-                let _ = cache.revert_pending_op(envelope_hash).await;
+                let _ = cache
+                    .revert_pending_op(account_id.clone(), envelope_hash)
+                    .await;
             }
 
             let _ = tx.send(BgResult::FlagOp {
@@ -759,12 +766,13 @@ impl App {
             None => return,
         };
         let cache = self.cache.clone();
+        let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let flags = store::flags_to_u8(was_read, new_starred);
             let op = if new_starred { "star" } else { "unstar" };
             let _ = cache
-                .update_flags(envelope_hash, flags, op.to_string())
+                .update_flags(account_id.clone(), envelope_hash, flags, op.to_string())
                 .await;
 
             let result = session
@@ -776,9 +784,13 @@ impl App {
                 .await;
 
             if result.is_ok() {
-                let _ = cache.clear_pending_op(envelope_hash, flags).await;
+                let _ = cache
+                    .clear_pending_op(account_id.clone(), envelope_hash, flags)
+                    .await;
             } else {
-                let _ = cache.revert_pending_op(envelope_hash).await;
+                let _ = cache
+                    .revert_pending_op(account_id.clone(), envelope_hash)
+                    .await;
             }
 
             let _ = tx.send(BgResult::FlagOp {
@@ -827,12 +839,14 @@ impl App {
             None => return,
         };
         let cache = self.cache.clone();
+        let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
         let saved_msg = msg.clone();
         tokio::spawn(async move {
             // Cache: mark as pending move
             let _ = cache
                 .update_flags(
+                    account_id.clone(),
                     envelope_hash,
                     store::flags_to_u8(saved_msg.is_read, saved_msg.is_starred),
                     format!("move:{dest_hash}"),
@@ -848,9 +862,13 @@ impl App {
                 .await;
 
             if result.is_ok() {
-                let _ = cache.remove_message(envelope_hash).await;
+                let _ = cache
+                    .remove_message(account_id.clone(), envelope_hash)
+                    .await;
             } else {
-                let _ = cache.revert_pending_op(envelope_hash).await;
+                let _ = cache
+                    .revert_pending_op(account_id.clone(), envelope_hash)
+                    .await;
             }
 
             let _ = tx.send(BgResult::MoveOp {
