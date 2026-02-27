@@ -1,8 +1,8 @@
-# nevermail-tui
+# neverlight-mail-tui
 
-Terminal email client powered by [nevermail-core](https://github.com/neverlight/nevermail-core). Built with [ratatui](https://ratatui.rs/) and [crossterm](https://crates.io/crates/crossterm).
+Terminal email client powered by [neverlight-mail-core](https://github.com/neverlight/neverlight-mail-core). Built with [ratatui](https://ratatui.rs/) and [crossterm](https://crates.io/crates/crossterm).
 
-Shares the same email engine, config files, and credential resolution as [nevermail](https://github.com/neverlight/nevermail) (COSMIC desktop client).
+Shares the same email engine, config files, and credential resolution as [neverlight-mail](https://github.com/jstelzer/neverlight-mail) (COSMIC desktop client).
 
 ![Compose overlay](screenshots/compose.png)
 ![Inline image rendering](screenshots/inline-image.png)
@@ -27,15 +27,15 @@ Shares the same email engine, config files, and credential resolution as [neverm
 ## Usage
 
 ```bash
-# Configure credentials (same env vars as nevermail)
-export NEVERMAIL_SERVER=mail.example.com
-export NEVERMAIL_USER=you@example.com
-export NEVERMAIL_PASSWORD=yourpassword
+# Configure credentials (same env vars as neverlight-mail)
+export NEVERLIGHT_MAIL_SERVER=mail.example.com
+export NEVERLIGHT_MAIL_USER=you@example.com
+export NEVERLIGHT_MAIL_PASSWORD=yourpassword
 
 cargo run
 ```
 
-Or use a `~/.config/nevermail/config.json` file — see [nevermail-core](https://github.com/neverlight/nevermail-core) for config resolution details.
+Or use a `~/.config/neverlight-mail/config.json` file — see [neverlight-mail-core](https://github.com/neverlight/neverlight-mail-core) for config resolution details.
 
 Multiple accounts are supported. All accounts from config resolution are connected on startup. Press `1`-`9` to switch between them.
 
@@ -128,7 +128,7 @@ Cache provides instant display of previously-seen folders, messages, and bodies 
 
 | Crate              | Purpose                                               |
 |--------------------|-------------------------------------------------------|
-| nevermail-core     | Email engine (IMAP, SMTP, MIME, cache, config)        |
+| neverlight-mail-core     | Email engine (IMAP, SMTP, MIME, cache, config)        |
 | ratatui            | TUI framework                                         |
 | crossterm          | Terminal backend (raw mode, alternate screen, events) |
 | ratatui-textarea   | Multiline text editor for compose                     |
@@ -141,8 +141,8 @@ Cache provides instant display of previously-seen folders, messages, and bodies 
 
 ## Related
 
-- [nevermail-core](https://github.com/neverlight/nevermail-core) — Headless email engine
-- [nevermail](https://github.com/neverlight/nevermail) — COSMIC desktop email client
+- [neverlight-mail-core](https://github.com/neverlight/neverlight-mail-core) — Headless email engine
+- [neverlight-mail](https://github.com/jstelzer/neverlight-mail) — COSMIC desktop email client
 
 ## License
 

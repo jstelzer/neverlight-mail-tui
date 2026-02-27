@@ -1,14 +1,14 @@
 [package]
-name = "nevermail-tui"
+name = "neverlight-mail-tui"
 version = "0.0.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "Terminal email client powered by nevermail-core"
-repository = "https://github.com/jstelzer/nevermail-tui"
+description = "Terminal email client powered by neverlight-mail-core"
+repository = "https://github.com/jstelzer/neverlight-mail-tui"
 
 [dependencies]
 # Email engine
-nevermail-core = "0.0.2"
+neverlight-mail-core = { path = "../neverlight-mail-core" }
 
 # TUI framework
 ratatui = "0.30"

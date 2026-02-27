@@ -1,12 +1,12 @@
-# Claude Context: nevermail-tui
+# Claude Context: neverlight-mail-tui
 
 **Last Updated:** 2026-02-26
 
 ## What This Is
 
-Terminal email client built on [nevermail-core](https://github.com/neverlight/nevermail-core) using [ratatui](https://ratatui.rs/) + crossterm. Feature-complete for daily email use — read, write, search, multi-account.
+Terminal email client built on [neverlight-mail-core](https://github.com/neverlight/neverlight-mail-core) using [ratatui](https://ratatui.rs/) + crossterm. Feature-complete for daily email use — read, write, search, multi-account.
 
-Shares the same email engine as [nevermail](https://github.com/neverlight/nevermail) (COSMIC desktop client). Same config files, same credential resolution, same IMAP session logic.
+Shares the same email engine as [neverlight-mail](https://github.com/jstelzer/neverlight-mail) (COSMIC desktop client). Same config files, same credential resolution, same IMAP session logic.
 
 ## Structure
 
@@ -58,7 +58,7 @@ All IMAP, cache, and SMTP calls run via `tokio::spawn`, sending results through 
 Flag toggles and move-to-folder update the UI immediately, then sync with IMAP in background. On failure, the UI reverts to the original state. Cache tracks pending operations for crash recovery.
 
 ### Threading
-Messages carry `thread_id` and `thread_depth` from nevermail-core. `recompute_visible()` builds `visible_indices` by filtering collapsed thread children. Space key toggles collapse on thread roots. Navigation uses visible_indices for correct up/down movement.
+Messages carry `thread_id` and `thread_depth` from neverlight-mail-core. `recompute_visible()` builds `visible_indices` by filtering collapsed thread children. Space key toggles collapse on thread roots. Navigation uses visible_indices for correct up/down movement.
 
 ### Search
 `/` enters search mode (replaces status bar with text input). Enter submits query to `cache.search()` (FTS5). Escape restores previous folder view.
@@ -72,7 +72,7 @@ On body load, image attachments (`AttachmentData::is_image()`) are decoded via t
 ### Mouse Support
 Mouse capture is enabled via crossterm. `handle_mouse()` in app.rs hit-tests click/scroll events against cached `LayoutRects` (saved by ui::render each frame). Click selects folders/messages and sets focus. Scroll wheel navigates lists or scrolls the body pane. Disabled during compose and search input modes.
 
-## Key nevermail-core APIs Used
+## Key neverlight-mail-core APIs Used
 
 | API | Purpose |
 |-----|---------|
@@ -103,7 +103,7 @@ Mouse capture is enabled via crossterm. `handle_mouse()` in app.rs hit-tests cli
 
 | Crate | Purpose |
 |-------|---------|
-| nevermail-core | Email engine (IMAP, SMTP, MIME, cache, config) |
+| neverlight-mail-core | Email engine (IMAP, SMTP, MIME, cache, config) |
 | ratatui | TUI framework |
 | crossterm | Terminal backend (raw mode, alternate screen, mouse, events) |
 | ratatui-textarea | Multiline text editor for compose body |
@@ -116,15 +116,15 @@ Mouse capture is enabled via crossterm. `handle_mouse()` in app.rs hit-tests cli
 
 ## Version Pinning
 
-This crate depends on nevermail-core which depends on melib. The lockfile must pin `imap-codec` and `imap-types` to `2.0.0-alpha.4`. See [nevermail-core/CLAUDE.md](../nevermail-core/CLAUDE.md) for details and re-pin commands.
+This crate depends on neverlight-mail-core which depends on melib. The lockfile must pin `imap-codec` and `imap-types` to `2.0.0-alpha.4`. See [neverlight-mail-core/CLAUDE.md](../neverlight-mail-core/CLAUDE.md) for details and re-pin commands.
 
 ## Credentials
 
-Same as nevermail — env vars or config file:
+Same as neverlight-mail — env vars or config file:
 ```bash
-export NEVERMAIL_SERVER=mail.example.com
-export NEVERMAIL_USER=you@example.com
-export NEVERMAIL_PASSWORD=yourpassword
+export NEVERLIGHT_MAIL_SERVER=mail.example.com
+export NEVERLIGHT_MAIL_USER=you@example.com
+export NEVERLIGHT_MAIL_PASSWORD=yourpassword
 ```
 
-Or `~/.config/nevermail/config.json` with keyring backend. Multiple accounts supported — all resolved accounts connect on startup.
+Or `~/.config/neverlight-mail/config.json` with keyring backend. Multiple accounts supported — all resolved accounts connect on startup.

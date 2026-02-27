@@ -6,11 +6,11 @@ use ratatui::prelude::Rect;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use nevermail_core::config::{AccountConfig, Config};
-use nevermail_core::imap::ImapSession;
-use nevermail_core::models::{AttachmentData, Folder, MessageSummary};
-use nevermail_core::store::{self, CacheHandle};
-use nevermail_core::{EnvelopeHash, FlagOp, MailboxHash, RefreshEventKind};
+use neverlight_mail_core::config::{AccountConfig, Config};
+use neverlight_mail_core::imap::ImapSession;
+use neverlight_mail_core::models::{AttachmentData, Folder, MessageSummary};
+use neverlight_mail_core::store::{self, CacheHandle};
+use neverlight_mail_core::{EnvelopeHash, FlagOp, MailboxHash, RefreshEventKind};
 use ratatui_image::picker::Picker;
 use ratatui_image::thread::{ResizeRequest, ThreadProtocol};
 
@@ -256,7 +256,7 @@ impl App {
                 futures::pin_mut!(stream);
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(nevermail_core::BackendEvent::Refresh(rev)) => {
+                        Ok(neverlight_mail_core::BackendEvent::Refresh(rev)) => {
                             let mailbox_hash = rev.mailbox_hash.0;
                             let kind = match rev.kind {
                                 RefreshEventKind::Create(_) => ImapEventKind::NewMail,
@@ -617,7 +617,7 @@ impl App {
         }
         let msg = &self.messages[self.selected_message];
         let env_hash_raw = msg.envelope_hash;
-        let env_hash = nevermail_core::EnvelopeHash(env_hash_raw);
+        let env_hash = neverlight_mail_core::EnvelopeHash(env_hash_raw);
         let message_idx = self.selected_message;
         self.status = "Loading body…".into();
 
@@ -648,7 +648,7 @@ impl App {
             let result = session.fetch_body(env_hash).await;
             let rendered = result
                 .map(|(text_plain, text_html, attachments)| {
-                    let rendered = nevermail_core::mime::render_body(
+                    let rendered = neverlight_mail_core::mime::render_body(
                         if text_plain.is_empty() {
                             None
                         } else {
@@ -697,9 +697,9 @@ impl App {
         let new_read = msg.is_read;
 
         let flag_op = if new_read {
-            FlagOp::Set(nevermail_core::Flag::SEEN)
+            FlagOp::Set(neverlight_mail_core::Flag::SEEN)
         } else {
-            FlagOp::UnSet(nevermail_core::Flag::SEEN)
+            FlagOp::UnSet(neverlight_mail_core::Flag::SEEN)
         };
 
         let session = match self.active_session() {
@@ -755,9 +755,9 @@ impl App {
         let new_starred = msg.is_starred;
 
         let flag_op = if new_starred {
-            FlagOp::Set(nevermail_core::Flag::FLAGGED)
+            FlagOp::Set(neverlight_mail_core::Flag::FLAGGED)
         } else {
-            FlagOp::UnSet(nevermail_core::Flag::FLAGGED)
+            FlagOp::UnSet(neverlight_mail_core::Flag::FLAGGED)
         };
 
         let session = match self.active_session() {
@@ -966,7 +966,7 @@ impl App {
             .cloned()
             .unwrap_or_else(|| acct_config.username.clone());
         let body_text = state.body.lines().join("\n");
-        let email = nevermail_core::smtp::OutgoingEmail {
+        let email = neverlight_mail_core::smtp::OutgoingEmail {
             from,
             to: state.to,
             subject: state.subject,
@@ -979,7 +979,7 @@ impl App {
         let tx = self.bg_tx.clone();
         self.status = "Sending…".into();
         tokio::spawn(async move {
-            let result = nevermail_core::smtp::send_email(&smtp_config, &email).await;
+            let result = neverlight_mail_core::smtp::send_email(&smtp_config, &email).await;
             let _ = tx.send(BgResult::SendResult(result));
         });
     }

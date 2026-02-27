@@ -46,7 +46,7 @@ impl ComposeState {
 }
 
 // ---------------------------------------------------------------------------
-// Compose helpers — lifted from nevermail GUI
+// Compose helpers — lifted from neverlight-mail GUI
 // ---------------------------------------------------------------------------
 
 pub fn quote_body(body: &str, from: &str, date: &str) -> String {

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use nevermail_core::models::MessageSummary;
+use neverlight_mail_core::models::MessageSummary;
 
 /// Compute thread sizes and visible indices from a message list and collapsed set.
 ///
