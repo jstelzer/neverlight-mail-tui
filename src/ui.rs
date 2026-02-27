@@ -164,7 +164,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let has_image = app.image_proto.is_some();
+    let has_image = !app.image_protos.is_empty();
     let has_attachments = !app.attachment_info.is_empty();
 
     // Build title with attachment info
@@ -200,13 +200,19 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(paragraph, sections[0]);
 
         // Image section
+        let img_title = if app.image_protos.len() > 1 {
+            format!(" \u{25c0} {}/{} \u{25b6} ", app.image_index + 1, app.image_protos.len())
+        } else {
+            String::new()
+        };
         let img_block = Block::default()
+            .title(img_title.as_str())
             .borders(Borders::ALL)
             .border_style(border_style);
         let img_inner = img_block.inner(sections[1]);
         frame.render_widget(img_block, sections[1]);
 
-        if let Some(proto) = &mut app.image_proto {
+        if let Some(proto) = app.image_protos.get_mut(app.image_index) {
             frame.render_stateful_widget(StatefulImage::default(), img_inner, proto);
         }
     } else {

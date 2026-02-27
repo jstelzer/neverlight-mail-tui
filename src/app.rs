@@ -125,8 +125,10 @@ pub struct App {
     pub layout_rects: LayoutRects,
     /// Terminal image protocol picker (sixel/kitty/halfblocks).
     picker: Option<Picker>,
-    /// Image protocol for the first inline image in the current message body.
-    pub image_proto: Option<ThreadProtocol>,
+    /// Image protocols for inline image attachments in the current message body.
+    pub image_protos: Vec<ThreadProtocol>,
+    /// Index of the currently displayed image in the carousel.
+    pub image_index: usize,
     /// Channel for image resize requests from ThreadProtocol.
     pub img_resize_rx: mpsc::UnboundedReceiver<ResizeRequest>,
     img_resize_tx: mpsc::UnboundedSender<ResizeRequest>,
@@ -221,7 +223,8 @@ impl App {
             bg_tx,
             layout_rects: LayoutRects::default(),
             picker: None,
-            image_proto: None,
+            image_protos: Vec::new(),
+            image_index: 0,
             img_resize_rx: img_rx,
             img_resize_tx: img_tx,
             attachment_info: Vec::new(),
@@ -334,7 +337,7 @@ impl App {
     /// Apply a completed image resize (from ThreadProtocol background work).
     pub fn apply_image_resize(&mut self, request: ResizeRequest) {
         if let Ok(resized) = request.resize_encode() {
-            if let Some(proto) = &mut self.image_proto {
+            if let Some(proto) = self.image_protos.get_mut(self.image_index) {
                 proto.update_resized_protocol(resized);
             }
         }
@@ -410,18 +413,18 @@ impl App {
                             .iter()
                             .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.len()))
                             .collect();
-                        // Create image protocol for the first image attachment
-                        self.image_proto = None;
+                        // Create image protocols for all image attachments
+                        self.image_protos.clear();
+                        self.image_index = 0;
                         if let Some(picker) = &self.picker {
                             for att in &attachments {
                                 if att.is_image() {
                                     if let Ok(img) = image::load_from_memory(&att.data) {
                                         let proto = picker.new_resize_protocol(img);
-                                        self.image_proto = Some(ThreadProtocol::new(
+                                        self.image_protos.push(ThreadProtocol::new(
                                             self.img_resize_tx.clone(),
                                             Some(proto),
                                         ));
-                                        break;
                                     }
                                 }
                             }
@@ -433,7 +436,8 @@ impl App {
                     Err(e) => {
                         self.body_text = Some(format!("Error: {e}"));
                         self.attachment_info.clear();
-                        self.image_proto = None;
+                        self.image_protos.clear();
+                        self.image_index = 0;
                         self.status = format!("Body error: {e}");
                     }
                 }
@@ -1093,6 +1097,20 @@ impl App {
                         "Account: {}",
                         self.active().config.label
                     );
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                if self.focus == Focus::Body && self.image_protos.len() > 1
+                    && self.image_index > 0
+                {
+                    self.image_index -= 1;
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                if self.focus == Focus::Body && self.image_protos.len() > 1
+                    && self.image_index + 1 < self.image_protos.len()
+                {
+                    self.image_index += 1;
                 }
             }
             _ => {}
