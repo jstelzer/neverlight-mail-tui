@@ -78,14 +78,14 @@ Multiple accounts are supported. All accounts from config resolution are connect
 
 ### Compose
 
-| Key     | Action                          |
-|---------|---------------------------------|
-| `c`     | Compose new message             |
-| `r`     | Reply to selected message       |
-| `f`     | Forward selected message        |
-| `Ctrl-S` | Send (in compose mode)         |
-| `Esc`   | Cancel compose                  |
-| `Tab`   | Next field (To → Subject → Body) |
+| Key      | Action                           |
+|----------|----------------------------------|
+| `c`      | Compose new message              |
+| `r`      | Reply to selected message        |
+| `f`      | Forward selected message         |
+| `Ctrl-S` | Send (in compose mode)           |
+| `Esc`    | Cancel compose                   |
+| `Tab`    | Next field (To → Subject → Body) |
 
 ### Multi-Account
 

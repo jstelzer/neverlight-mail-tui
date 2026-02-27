@@ -52,7 +52,7 @@ fn run_form(
                 }
                 KeyCode::Tab => SetupInput::NextField,
                 KeyCode::BackTab => SetupInput::PrevField,
-                KeyCode::Char(' ') if model.active_field == FieldId::Starttls => {
+                KeyCode::Char(' ') if model.active_field.is_toggle() => {
                     SetupInput::Toggle
                 }
                 KeyCode::Char(c) => SetupInput::InsertChar(c),
@@ -76,8 +76,9 @@ fn render(frame: &mut Frame, model: &SetupModel) {
     let area = frame.area();
 
     // Center a dialog box
-    let dialog_w = 50u16.min(area.width.saturating_sub(4));
-    let dialog_h = 16u16.min(area.height.saturating_sub(2));
+    let is_password_only = matches!(model.request, neverlight_mail_core::setup::SetupRequest::PasswordOnly { .. });
+    let dialog_w = 60u16.min(area.width.saturating_sub(4));
+    let dialog_h = if is_password_only { 10u16 } else { 28u16 }.min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(dialog_w)) / 2;
     let y = (area.height.saturating_sub(dialog_h)) / 2;
     let dialog = Rect::new(x, y, dialog_w, dialog_h);
@@ -95,77 +96,40 @@ fn render(frame: &mut Frame, model: &SetupModel) {
     let field_w = inner.width.saturating_sub(16) as usize;
 
     let text_fields: [(FieldId, &str); 6] = [
-        (FieldId::Label, "      Label"),
-        (FieldId::Server, "IMAP Server"),
-        (FieldId::Port, "       Port"),
-        (FieldId::Username, "   Username"),
-        (FieldId::Password, "   Password"),
-        (FieldId::Email, " From Email"),
+        (FieldId::Label, "       Label"),
+        (FieldId::Server, " IMAP Server"),
+        (FieldId::Port, "        Port"),
+        (FieldId::Username, "    Username"),
+        (FieldId::Password, "    Password"),
+        (FieldId::Email, "  From Email"),
     ];
 
     for (field, label) in &text_fields {
-        let active = model.active_field == *field;
-        let readonly = model.is_readonly(*field);
-        let value = model.field_value(*field);
-
-        let display_val = if field.is_secret() {
-            "*".repeat(value.len())
-        } else {
-            value.to_string()
-        };
-
-        let mut rendered = if active && !readonly {
-            format!("{}_", display_val)
-        } else {
-            display_val
-        };
-        rendered.truncate(field_w);
-
-        let label_style = if readonly {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-        let value_style = if active && !readonly {
-            Style::default().fg(Color::Yellow)
-        } else if readonly {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}: ", label), label_style),
-            Span::styled(rendered, value_style),
-        ]));
+        render_text_field(&mut lines, model, *field, label, field_w);
     }
 
     // STARTTLS toggle
-    {
-        let active = model.active_field == FieldId::Starttls;
-        let readonly = model.is_readonly(FieldId::Starttls);
-        let check = if model.starttls { "x" } else { " " };
-        let label_style = if readonly {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-        let value_style = if active && !readonly {
-            Style::default().fg(Color::Yellow)
-        } else if readonly {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
+    render_toggle_field(&mut lines, model, FieldId::Starttls, "STARTTLS", model.starttls);
 
-        lines.push(Line::from(vec![
-            Span::styled("    STARTTLS: ", label_style),
-            Span::styled(format!("[{}]", check), value_style),
-            Span::styled(
-                " (Space to toggle)",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+    // SMTP overrides section (only for Full/Edit)
+    if !is_password_only {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  SMTP (optional — blank = use IMAP)",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let smtp_fields: [(FieldId, &str); 4] = [
+            (FieldId::SmtpServer, " SMTP Server"),
+            (FieldId::SmtpPort, "   SMTP Port"),
+            (FieldId::SmtpUsername, "   SMTP User"),
+            (FieldId::SmtpPassword, "   SMTP Pass"),
+        ];
+        for (field, label) in &smtp_fields {
+            render_text_field(&mut lines, model, *field, label, field_w);
+        }
+
+        render_toggle_field(&mut lines, model, FieldId::SmtpStarttls, "SMTP TLS", model.smtp_starttls);
     }
 
     lines.push(Line::from(""));
@@ -187,4 +151,85 @@ fn render(frame: &mut Frame, model: &SetupModel) {
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+}
+
+// ---------------------------------------------------------------------------
+// Render helpers
+// ---------------------------------------------------------------------------
+
+fn render_text_field<'a>(
+    lines: &mut Vec<Line<'a>>,
+    model: &SetupModel,
+    field: FieldId,
+    label: &'a str,
+    field_w: usize,
+) {
+    let active = model.active_field == field;
+    let readonly = model.is_readonly(field);
+    let value = model.field_value(field);
+
+    let display_val = if field.is_secret() {
+        "*".repeat(value.len())
+    } else {
+        value.to_string()
+    };
+
+    let mut rendered = if active && !readonly {
+        format!("{}_", display_val)
+    } else {
+        display_val
+    };
+    rendered.truncate(field_w);
+
+    let label_style = if readonly {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let value_style = if active && !readonly {
+        Style::default().fg(Color::Yellow)
+    } else if readonly {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}: ", label), label_style),
+        Span::styled(rendered, value_style),
+    ]));
+}
+
+fn render_toggle_field<'a>(
+    lines: &mut Vec<Line<'a>>,
+    model: &SetupModel,
+    field: FieldId,
+    label: &'a str,
+    value: bool,
+) {
+    let active = model.active_field == field;
+    let readonly = model.is_readonly(field);
+    let check = if value { "x" } else { " " };
+
+    let label_style = if readonly {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let value_style = if active && !readonly {
+        Style::default().fg(Color::Yellow)
+    } else if readonly {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("    {}: ", label), label_style),
+        Span::styled(format!("[{}]", check), value_style),
+        Span::styled(
+            " (Space to toggle)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
 }
