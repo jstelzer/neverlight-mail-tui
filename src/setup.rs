@@ -61,6 +61,7 @@ struct SetupState {
 enum SetupMode {
     Full,
     PasswordOnly {
+        account_id: String,
         server: String,
         username: String,
     },
@@ -89,6 +90,7 @@ pub fn run_setup(needs: ConfigNeedsInput) -> anyhow::Result<SetupResult> {
             error: None,
         },
         ConfigNeedsInput::PasswordOnly {
+            account_id,
             server,
             port,
             username,
@@ -96,6 +98,7 @@ pub fn run_setup(needs: ConfigNeedsInput) -> anyhow::Result<SetupResult> {
             error,
         } => SetupState {
             mode: SetupMode::PasswordOnly {
+                account_id: account_id.clone(),
                 server: server.clone(),
                 username: username.clone(),
             },
@@ -144,35 +147,23 @@ fn run_form(
                     }
                 }
                 KeyCode::Tab => {
-                    state.active_field = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        state.active_field.prev()
-                    } else {
-                        state.active_field.next()
-                    };
-                    // Skip read-only fields in PasswordOnly mode
-                    if matches!(state.mode, SetupMode::PasswordOnly { .. }) {
-                        while state.active_field != SetupField::Password
-                            && state.active_field != SetupField::Starttls
-                        {
-                            state.active_field = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                state.active_field.prev()
-                            } else {
-                                state.active_field.next()
-                            };
-                        }
+                    if !matches!(state.mode, SetupMode::PasswordOnly { .. }) {
+                        state.active_field = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            state.active_field.prev()
+                        } else {
+                            state.active_field.next()
+                        };
                     }
                 }
                 KeyCode::BackTab => {
-                    state.active_field = state.active_field.prev();
-                    if matches!(state.mode, SetupMode::PasswordOnly { .. }) {
-                        while state.active_field != SetupField::Password
-                            && state.active_field != SetupField::Starttls
-                        {
-                            state.active_field = state.active_field.prev();
-                        }
+                    if !matches!(state.mode, SetupMode::PasswordOnly { .. }) {
+                        state.active_field = state.active_field.prev();
                     }
                 }
-                KeyCode::Char(' ') if state.active_field == SetupField::Starttls => {
+                KeyCode::Char(' ')
+                    if state.active_field == SetupField::Starttls
+                        && !matches!(state.mode, SetupMode::PasswordOnly { .. }) =>
+                {
                     state.starttls = !state.starttls;
                 }
                 KeyCode::Char(c) => {
@@ -217,6 +208,7 @@ fn active_text_field(state: &mut SetupState) -> Option<&mut String> {
 fn try_submit(state: &mut SetupState) -> Option<anyhow::Result<SetupResult>> {
     match &state.mode {
         SetupMode::PasswordOnly {
+            account_id,
             server,
             username,
         } => {
@@ -224,12 +216,10 @@ fn try_submit(state: &mut SetupState) -> Option<anyhow::Result<SetupResult>> {
                 state.error = Some("Password is required".into());
                 return None;
             }
-            let server = server.clone();
-            let username = username.clone();
 
             // Store password in keyring, fall back to updating config with plaintext
             let password_backend =
-                match neverlight_mail_core::keyring::set_password(&username, &server, &state.password) {
+                match neverlight_mail_core::keyring::set_password(username, server, &state.password) {
                     Ok(()) => PasswordBackend::Keyring,
                     Err(e) => {
                         log::warn!("Keyring unavailable ({}), using plaintext", e);
@@ -239,7 +229,7 @@ fn try_submit(state: &mut SetupState) -> Option<anyhow::Result<SetupResult>> {
                     }
                 };
 
-            // Load existing config, update matching account's password backend
+            // Load existing config, update matching account by ID
             let mut multi = match MultiAccountFileConfig::load() {
                 Ok(Some(m)) => m,
                 _ => {
@@ -247,11 +237,7 @@ fn try_submit(state: &mut SetupState) -> Option<anyhow::Result<SetupResult>> {
                     return None;
                 }
             };
-            if let Some(acct) = multi
-                .accounts
-                .iter_mut()
-                .find(|a| a.server == server && a.username == username)
-            {
+            if let Some(acct) = multi.accounts.iter_mut().find(|a| a.id == *account_id) {
                 acct.password = password_backend;
             }
             if let Err(e) = multi.save() {
@@ -319,9 +305,11 @@ fn try_submit(state: &mut SetupState) -> Option<anyhow::Result<SetupResult>> {
                 smtp: SmtpOverrides::default(),
             };
 
-            let multi = MultiAccountFileConfig {
-                accounts: vec![fac],
-            };
+            let mut multi = MultiAccountFileConfig::load()
+                .ok()
+                .flatten()
+                .unwrap_or(MultiAccountFileConfig { accounts: Vec::new() });
+            multi.accounts.push(fac);
             if let Err(e) = multi.save() {
                 state.error = Some(format!("Failed to save config: {e}"));
                 return None;
