@@ -6,7 +6,7 @@ use ratatui::prelude::Rect;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use neverlight_mail_core::config::{AccountConfig, Config};
+use neverlight_mail_core::config::AccountConfig;
 use neverlight_mail_core::imap::ImapSession;
 use neverlight_mail_core::models::{AttachmentData, Folder, MessageSummary};
 use neverlight_mail_core::store::{self, CacheHandle};
@@ -179,19 +179,13 @@ impl App {
         &self.active().folders
     }
 
-    pub async fn new() -> anyhow::Result<Self> {
-        let configs = Config::resolve_all_accounts()
-            .map_err(|e| anyhow::anyhow!("Config error: {e:?}"))?;
-        if configs.is_empty() {
-            return Err(anyhow::anyhow!("No accounts configured"));
-        }
-
+    pub async fn with_accounts(accounts: Vec<AccountConfig>) -> anyhow::Result<Self> {
         let cache = CacheHandle::open().map_err(|e| anyhow::anyhow!("{e}"))?;
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let (img_tx, img_rx) = mpsc::unbounded_channel();
 
         let mut account_states = Vec::new();
-        for config in configs {
+        for config in accounts {
             let imap_config = config.to_imap_config();
             let session = ImapSession::connect(imap_config).await.ok();
             account_states.push(AccountState {

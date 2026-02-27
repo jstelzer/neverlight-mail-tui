@@ -1,5 +1,6 @@
 mod app;
 mod compose;
+mod setup;
 mod threading;
 mod ui;
 
@@ -12,13 +13,28 @@ use futures::StreamExt;
 use ratatui::prelude::*;
 use ratatui_image::picker::Picker;
 
+use neverlight_mail_core::config::Config;
+
 use app::{App, AppEvent};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let mut app = App::new().await?;
+    let accounts = match Config::resolve_all_accounts() {
+        Ok(accounts) if !accounts.is_empty() => accounts,
+        Ok(_) => return Err(anyhow::anyhow!("No accounts configured")),
+        Err(needs_input) => {
+            match setup::run_setup(needs_input)? {
+                setup::SetupResult::Cancelled => return Ok(()),
+                setup::SetupResult::Configured => {}
+            }
+            Config::resolve_all_accounts()
+                .map_err(|e| anyhow::anyhow!("Config error after setup: {e:?}"))?
+        }
+    };
+
+    let mut app = App::with_accounts(accounts).await?;
 
     // Terminal setup
     terminal::enable_raw_mode()?;
