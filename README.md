@@ -139,6 +139,7 @@ Cache provides instant display of previously-seen folders, messages, and bodies 
 | anyhow             | Error handling                                        |
 | log / env_logger   | `RUST_LOG` logging                                    |
 
+
 ## Terminal matters
 
 Inline image quality depends entirely on what your terminal negotiates with `ratatui-image`. The app auto-detects the best available protocol at startup — same code, very different results:
@@ -148,10 +149,10 @@ Inline image quality depends entirely on what your terminal negotiates with `rat
 | WezTerm         | Kitty/Sixel | Full-fidelity inline images |
 | Kitty           | Kitty       | Full-fidelity inline images |
 | iTerm2          | iTerm2      | Full-fidelity inline images |
-| COSMIC Terminal | Halfblocks  | Low-res block approximation |
-| Most others     | Halfblocks  | Low-res block approximation |
+| COSMIC Terminal | Halfblocks  | Block-based approximation   |
+| Most others     | Halfblocks  | Block-based approximation   |
 
-If your images look muddy or pixelated, it's the terminal, not the app. WezTerm in particular looks excellent.
+If your images look low-resolution or blocky, your terminal likely does not support an inline image protocol. Try WezTerm, Kitty, or iTerm2 for the full experience.
 
 ## Related
 
