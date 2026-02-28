@@ -6,7 +6,7 @@ mod ui;
 
 use std::io;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
@@ -16,6 +16,17 @@ use ratatui_image::picker::Picker;
 use neverlight_mail_core::config::Config;
 
 use app::{App, AppEvent};
+
+/// RAII guard that restores the terminal on drop (including panics).
+struct TermGuard;
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = io::stdout().execute(crossterm::event::DisableMouseCapture);
+        let _ = terminal::disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(crossterm::event::EnableMouseCapture)?;
+    let _guard = TermGuard; // restores terminal on drop (including panics)
 
     // Detect terminal image protocol (sixel/kitty/iterm2/halfblocks).
     // Must happen AFTER alternate screen, BEFORE EventStream.
@@ -49,14 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &mut app).await;
-
-    // Terminal restore (always, even on error)
-    io::stdout().execute(crossterm::event::DisableMouseCapture)?;
-    terminal::disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
-
-    result
+    run(&mut terminal, &mut app).await
 }
 
 async fn run(
@@ -79,7 +84,17 @@ async fn run(
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
-                        app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+                        match mouse.kind {
+                            MouseEventKind::Down(_)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown => {
+                                app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+                            }
+                            _ => continue, // skip redraw for move/drag noise
+                        }
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        // Wake is enough — draw() at loop top picks up new size.
                     }
                     Some(Err(_)) => break,
                     _ => {}
