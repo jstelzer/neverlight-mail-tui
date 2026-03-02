@@ -180,7 +180,7 @@ impl App {
     }
 
     pub async fn with_accounts(accounts: Vec<AccountConfig>) -> anyhow::Result<Self> {
-        let cache = CacheHandle::open().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let cache = CacheHandle::open("tui").map_err(|e| anyhow::anyhow!("{e}"))?;
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let (img_tx, img_rx) = mpsc::unbounded_channel();
 

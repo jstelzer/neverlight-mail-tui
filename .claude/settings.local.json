@@ -13,7 +13,10 @@
       "Bash(grep:*)",
       "Bash(ls:*)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(sqlite3:*)",
+      "Bash(fuser:*)",
+      "Bash(ps:*)"
     ]
   }
 }
