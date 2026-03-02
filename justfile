@@ -6,3 +6,5 @@ build:
     cargo build
     cargo test
 
+run:
+    cargo run -r

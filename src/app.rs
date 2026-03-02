@@ -11,7 +11,8 @@ use neverlight_mail_core::imap::ImapSession;
 use neverlight_mail_core::models::{AttachmentData, Folder, MessageSummary};
 use neverlight_mail_core::store::{self, CacheHandle};
 use neverlight_mail_core::{EnvelopeHash, FlagOp, MailboxHash, RefreshEventKind};
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::StatefulProtocolType;
 use ratatui_image::thread::{ResizeRequest, ThreadProtocol};
 
 use crate::compose::{self, ComposeField, ComposeMode, ComposeState};
@@ -125,6 +126,8 @@ pub struct App {
     pub layout_rects: LayoutRects,
     /// Terminal image protocol picker (sixel/kitty/halfblocks).
     picker: Option<Picker>,
+    /// Picker-selected protocol for runtime diagnostics.
+    pub picker_protocol: Option<ProtocolType>,
     /// Image protocols for inline image attachments in the current message body.
     pub image_protos: Vec<ThreadProtocol>,
     /// Index of the currently displayed image in the carousel.
@@ -217,6 +220,7 @@ impl App {
             bg_tx,
             layout_rects: LayoutRects::default(),
             picker: None,
+            picker_protocol: None,
             image_protos: Vec::new(),
             image_index: 0,
             img_resize_rx: img_rx,
@@ -325,7 +329,41 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn set_picker(&mut self, picker: Picker) {
+        self.picker_protocol = Some(picker.protocol_type());
         self.picker = Some(picker);
+    }
+
+    fn protocol_type_name(protocol_type: ProtocolType) -> &'static str {
+        match protocol_type {
+            ProtocolType::Halfblocks => "halfblocks",
+            ProtocolType::Sixel => "sixel",
+            ProtocolType::Kitty => "kitty",
+            ProtocolType::Iterm2 => "iterm2",
+        }
+    }
+
+    fn stateful_protocol_name(protocol_type: &StatefulProtocolType) -> &'static str {
+        match protocol_type {
+            StatefulProtocolType::Halfblocks(_) => "halfblocks",
+            StatefulProtocolType::Sixel(_) => "sixel",
+            StatefulProtocolType::Kitty(_) => "kitty",
+            StatefulProtocolType::ITerm2(_) => "iterm2",
+        }
+    }
+
+    pub fn image_protocol_label(&self) -> String {
+        let picker = self
+            .picker_protocol
+            .map(Self::protocol_type_name)
+            .unwrap_or("none");
+        let render = match self.image_protos.get(self.image_index) {
+            Some(proto) => proto
+                .protocol_type()
+                .map(Self::stateful_protocol_name)
+                .unwrap_or("pending"),
+            None => "none",
+        };
+        format!("picker:{picker} render:{render}")
     }
 
     /// Apply a completed image resize (from ThreadProtocol background work).

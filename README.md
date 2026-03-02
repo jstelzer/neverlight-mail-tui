@@ -148,13 +148,16 @@ Inline image quality depends entirely on what your terminal negotiates with `rat
 |-----------------|-------------|-----------------------------|
 | WezTerm         | Kitty/Sixel | Full-fidelity inline images |
 | Kitty           | Kitty       | Full-fidelity inline images |
-| iTerm2          | iTerm2      | no images                   |
+| iTerm2          | iTerm2      | Full-fidelity inline images |
 | COSMIC Terminal | Halfblocks  | Block-based approximation   |
 | Most others     | Halfblocks  | Block-based approximation   |
 | Ghostty         | Kitty/Sixel | Full-fidelity inline images |
 
 
 If your images look low-resolution or blocky, your terminal likely does not support an inline image protocol. Try WezTerm, Kitty, or iTerm2 for the full experience.
+
+On iTerm2, inline image rendering uses OSC 1337 and may trigger a one-time permission prompt
+(`Allow "<app>" to display inline images`). Choose `Allow` to enable rendering.
 
 ## Related
 

@@ -168,16 +168,17 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     let has_attachments = !app.attachment_info.is_empty();
 
     // Build title with attachment info
+    let proto = app.image_protocol_label();
     let title = if has_attachments {
         let total = app.attachment_info.len();
         let img_count = app.attachment_info.iter().filter(|(_, m, _)| m.starts_with("image/")).count();
         if img_count > 0 {
-            format!(" Preview [{total} attachments, {img_count} images] ")
+            format!(" Preview [{total} attachments, {img_count} images] ({proto}) ")
         } else {
-            format!(" Preview [{total} attachments] ")
+            format!(" Preview [{total} attachments] ({proto}) ")
         }
     } else {
-        " Preview ".to_string()
+        format!(" Preview ({proto}) ")
     };
 
     if has_image {

@@ -4,6 +4,7 @@ mod setup;
 mod threading;
 mod ui;
 
+use std::env;
 use std::io;
 
 use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
@@ -11,7 +12,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use ratatui::prelude::*;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 use neverlight_mail_core::config::Config;
 
@@ -26,6 +27,24 @@ impl Drop for TermGuard {
         let _ = terminal::disable_raw_mode();
         let _ = io::stdout().execute(LeaveAlternateScreen);
     }
+}
+
+fn is_iterm2_like_terminal() -> bool {
+    env::var("TERM_PROGRAM").is_ok_and(|v| v.contains("iTerm"))
+        || env::var("LC_TERMINAL").is_ok_and(|v| v.contains("iTerm"))
+}
+
+fn detect_picker() -> Picker {
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
+    // In iTerm2 sessions, force iTerm2 protocol.
+    // Some environments report kitty capabilities but don't correctly render
+    // ratatui-image's kitty stateful path, resulting in an empty image pane.
+    if is_iterm2_like_terminal() {
+        picker.set_protocol_type(ProtocolType::Iterm2);
+    }
+
+    picker
 }
 
 #[tokio::main]
@@ -55,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Detect terminal image protocol (sixel/kitty/iterm2/halfblocks).
     // Must happen AFTER alternate screen, BEFORE EventStream.
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let picker = detect_picker();
     app.set_picker(picker);
 
     let backend = CrosstermBackend::new(io::stdout());
