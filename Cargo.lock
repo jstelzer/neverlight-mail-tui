@@ -2407,8 +2407,6 @@ dependencies = [
 [[package]]
 name = "neverlight-mail-core"
 version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "260d82abcc32a82eeef2e0214db5de737c44be3fb147f00ddef363b8b47efaf8"
 dependencies = [
  "dirs",
  "futures",
