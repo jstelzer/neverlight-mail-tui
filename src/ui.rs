@@ -119,8 +119,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 String::new()
             };
-            let line =
-                format!("{marker}{star}{indent}{collapse}{} — {}", m.from, m.subject);
+            let line = format!("{marker}{star}{indent}{collapse}{} — {}", m.from, m.subject);
             ListItem::new(line)
         })
         .collect();
@@ -171,7 +170,11 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     let proto = app.image_protocol_label();
     let title = if has_attachments {
         let total = app.attachment_info.len();
-        let img_count = app.attachment_info.iter().filter(|(_, m, _)| m.starts_with("image/")).count();
+        let img_count = app
+            .attachment_info
+            .iter()
+            .filter(|(_, m, _)| m.starts_with("image/"))
+            .count();
         if img_count > 0 {
             format!(" Preview [{total} attachments, {img_count} images] ({proto}) ")
         } else {
@@ -202,7 +205,11 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
 
         // Image section
         let img_title = if app.image_protos.len() > 1 {
-            format!(" \u{25c0} {}/{} \u{25b6} ", app.image_index + 1, app.image_protos.len())
+            format!(
+                " \u{25c0} {}/{} \u{25b6} ",
+                app.image_index + 1,
+                app.image_protos.len()
+            )
         } else {
             String::new()
         };
@@ -277,13 +284,13 @@ fn render_compose(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(subj_line).style(subj_style), rows[1]);
 
     // Body (tui-textarea)
-    let body_block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(if state.active_field == ComposeField::Body {
+    let body_block = Block::default().borders(Borders::TOP).border_style(
+        if state.active_field == ComposeField::Body {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
-        });
+        },
+    );
     frame.render_widget(&state.body, body_block.inner(rows[2]));
     frame.render_widget(body_block, rows[2]);
 }
@@ -310,12 +317,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     if app.search_active {
         let search_line = format!("/{}_", app.search_query);
-        let status = Paragraph::new(search_line)
-            .style(Style::default().fg(Color::Cyan).bold());
+        let status = Paragraph::new(search_line).style(Style::default().fg(Color::Cyan).bold());
         frame.render_widget(status, area);
     } else {
-        let status = Paragraph::new(app.status.as_str())
-            .style(Style::default().fg(Color::Yellow));
+        let status = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Yellow));
         frame.render_widget(status, area);
     }
 }
