@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
-use ratatui::prelude::Rect;
 use futures::StreamExt;
+use ratatui::prelude::Rect;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use neverlight_mail_core::config::AccountConfig;
 use neverlight_mail_core::imap::ImapSession;
@@ -23,22 +25,36 @@ use crate::compose::{self, ComposeField, ComposeMode, ComposeState};
 
 #[allow(dead_code)]
 pub enum BgResult {
-    Folders(Result<Vec<Folder>, String>),
-    Messages {
-        folder_idx: usize,
-        result: Result<Vec<MessageSummary>, String>,
+    Folders {
+        account_idx: usize,
+        lane_epoch: u64,
+        result: Result<Vec<Folder>, String>,
     },
-    Body {
-        message_idx: usize,
-        result: Result<(String, Vec<AttachmentData>), String>,
+    Messages {
+        account_idx: usize,
+        lane_epoch: u64,
+        folder_idx: usize,
+        mailbox_hash: u64,
+        result: Result<Vec<MessageSummary>, String>,
     },
     /// Cached messages arrived (show immediately, IMAP fetch may follow)
     CachedMessages {
+        account_idx: usize,
+        lane_epoch: u64,
         folder_idx: usize,
+        mailbox_hash: u64,
         result: Result<Vec<MessageSummary>, String>,
+    },
+    Body {
+        account_idx: usize,
+        lane_epoch: u64,
+        envelope_hash: u64,
+        result: Result<(String, Vec<AttachmentData>), String>,
     },
     /// Flag operation completed (or failed — revert optimistic update)
     FlagOp {
+        account_idx: usize,
+        lane_epoch: u64,
         envelope_hash: u64,
         /// Original flags to restore on failure
         was_read: bool,
@@ -47,12 +63,23 @@ pub enum BgResult {
     },
     /// Move operation completed (or failed — revert optimistic removal)
     MoveOp {
+        account_idx: usize,
+        lane_epoch: u64,
         envelope_hash: u64,
+        source_mailbox_hash: u64,
+        destination_name: String,
+        reconciled_source_toc: Option<Vec<MessageSummary>>,
+        retryable: bool,
+        postcondition_failed: bool,
         /// Original message + index for reinsertion on failure
         message: Box<Option<(usize, MessageSummary)>>,
         result: Result<(), String>,
     },
-    SearchResults(Result<Vec<MessageSummary>, String>),
+    SearchResults {
+        account_idx: usize,
+        lane_epoch: u64,
+        result: Result<Vec<MessageSummary>, String>,
+    },
     SendResult(Result<(), String>),
     /// IDLE event: server notified of new/changed/removed messages
     ImapEvent {
@@ -111,6 +138,7 @@ pub struct App {
     pub selected_message: usize,
     pub focus: Focus,
     pub status: String,
+    pub phase: Phase,
     pub search_active: bool,
     pub search_query: String,
     pub compose: Option<ComposeState>,
@@ -137,6 +165,9 @@ pub struct App {
     img_resize_tx: mpsc::UnboundedSender<ResizeRequest>,
     /// Attachment summary for the current message (filename, mime_type, size).
     pub attachment_info: Vec<(String, String, usize)>,
+    lane_epochs: LaneEpochs,
+    lane_tasks: LaneTasks,
+    pub diagnostics: Diagnostics,
 }
 
 /// Cached layout geometry for mouse hit-testing.
@@ -157,6 +188,64 @@ pub enum Focus {
 pub enum AppEvent {
     Continue,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Idle,
+    Loading,
+    Refreshing,
+    Searching,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Folder,
+    Message,
+    Search,
+    Flag,
+    Mutation,
+}
+
+#[derive(Default)]
+struct LaneEpochs {
+    folder: u64,
+    message: u64,
+    search: u64,
+    flag: u64,
+    mutation: u64,
+}
+
+#[derive(Default)]
+struct LaneTasks {
+    folder: Vec<JoinHandle<()>>,
+    message: Option<JoinHandle<()>>,
+    search: Option<JoinHandle<()>>,
+    flag: Option<JoinHandle<()>>,
+    mutation: Option<JoinHandle<()>>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct LaneOpIds {
+    pub folder: u64,
+    pub message: u64,
+    pub search: u64,
+    pub flag: u64,
+    pub mutation: u64,
+}
+
+#[derive(Default)]
+pub struct Diagnostics {
+    pub current_op_ids: LaneOpIds,
+    pub toc_drift_count: u64,
+    pub postcondition_failure_count: u64,
+    pub refresh_stuck_count: u64,
+    pub refresh_timeout_count: u64,
+    next_op_id: u64,
+    refresh_started_at: Option<Instant>,
+    refresh_stuck_reported: bool,
+    refresh_timeout_reported: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +288,7 @@ impl App {
             });
         }
 
-        let app = App {
+        let mut app = App {
             accounts: account_states,
             active_account: 0,
             cache,
@@ -210,6 +299,7 @@ impl App {
             selected_message: 0,
             focus: Focus::Folders,
             status: "Connecting…".into(),
+            phase: Phase::Loading,
             search_active: false,
             search_query: String::new(),
             compose: None,
@@ -226,6 +316,9 @@ impl App {
             img_resize_rx: img_rx,
             img_resize_tx: img_tx,
             attachment_info: Vec::new(),
+            lane_epochs: LaneEpochs::default(),
+            lane_tasks: LaneTasks::default(),
+            diagnostics: Diagnostics::default(),
         };
 
         app.spawn_load_folders();
@@ -258,9 +351,7 @@ impl App {
                             let mailbox_hash = rev.mailbox_hash.0;
                             let kind = match rev.kind {
                                 RefreshEventKind::Create(_) => ImapEventKind::NewMail,
-                                RefreshEventKind::Remove(hash) => {
-                                    ImapEventKind::Remove(hash.0)
-                                }
+                                RefreshEventKind::Remove(hash) => ImapEventKind::Remove(hash.0),
                                 RefreshEventKind::Rescan => ImapEventKind::Rescan,
                                 _ => continue,
                             };
@@ -324,6 +415,192 @@ impl App {
         self.recompute_visible();
     }
 
+    fn bump_lane_epoch(&mut self, lane: Lane) -> u64 {
+        let slot = match lane {
+            Lane::Folder => &mut self.lane_epochs.folder,
+            Lane::Message => &mut self.lane_epochs.message,
+            Lane::Search => &mut self.lane_epochs.search,
+            Lane::Flag => &mut self.lane_epochs.flag,
+            Lane::Mutation => &mut self.lane_epochs.mutation,
+        };
+        *slot = slot.saturating_add(1);
+        *slot
+    }
+
+    fn lane_epoch(&self, lane: Lane) -> u64 {
+        match lane {
+            Lane::Folder => self.lane_epochs.folder,
+            Lane::Message => self.lane_epochs.message,
+            Lane::Search => self.lane_epochs.search,
+            Lane::Flag => self.lane_epochs.flag,
+            Lane::Mutation => self.lane_epochs.mutation,
+        }
+    }
+
+    fn lane_name(lane: Lane) -> &'static str {
+        match lane {
+            Lane::Folder => "folder",
+            Lane::Message => "message",
+            Lane::Search => "search",
+            Lane::Flag => "flag",
+            Lane::Mutation => "mutation",
+        }
+    }
+
+    fn set_current_op_id(&mut self, lane: Lane, op_id: u64) {
+        match lane {
+            Lane::Folder => self.diagnostics.current_op_ids.folder = op_id,
+            Lane::Message => self.diagnostics.current_op_ids.message = op_id,
+            Lane::Search => self.diagnostics.current_op_ids.search = op_id,
+            Lane::Flag => self.diagnostics.current_op_ids.flag = op_id,
+            Lane::Mutation => self.diagnostics.current_op_ids.mutation = op_id,
+        }
+    }
+
+    fn begin_refresh_watchdog(&mut self) {
+        self.diagnostics.refresh_started_at = Some(Instant::now());
+        self.diagnostics.refresh_stuck_reported = false;
+        self.diagnostics.refresh_timeout_reported = false;
+    }
+
+    fn clear_refresh_watchdog(&mut self) {
+        self.diagnostics.refresh_started_at = None;
+        self.diagnostics.refresh_stuck_reported = false;
+        self.diagnostics.refresh_timeout_reported = false;
+    }
+
+    fn check_refresh_watchdog(&mut self) {
+        const REFRESH_STUCK_AFTER: Duration = Duration::from_secs(10);
+        const REFRESH_TIMEOUT_AFTER: Duration = Duration::from_secs(20);
+        if self.phase != Phase::Refreshing {
+            return;
+        }
+        let Some(started) = self.diagnostics.refresh_started_at else {
+            return;
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= REFRESH_STUCK_AFTER && !self.diagnostics.refresh_stuck_reported {
+            self.diagnostics.refresh_stuck_count =
+                self.diagnostics.refresh_stuck_count.saturating_add(1);
+            self.diagnostics.refresh_stuck_reported = true;
+            log::warn!(
+                "refresh-stuck count={}",
+                self.diagnostics.refresh_stuck_count
+            );
+        }
+        if elapsed >= REFRESH_TIMEOUT_AFTER && !self.diagnostics.refresh_timeout_reported {
+            self.diagnostics.refresh_timeout_count =
+                self.diagnostics.refresh_timeout_count.saturating_add(1);
+            self.diagnostics.refresh_timeout_reported = true;
+            log::warn!(
+                "refresh-timeout count={}",
+                self.diagnostics.refresh_timeout_count
+            );
+        }
+    }
+
+    fn cancel_lane(&mut self, lane: Lane) {
+        match lane {
+            Lane::Folder => {
+                for handle in self.lane_tasks.folder.drain(..) {
+                    handle.abort();
+                }
+            }
+            Lane::Message => {
+                if let Some(handle) = self.lane_tasks.message.take() {
+                    handle.abort();
+                }
+            }
+            Lane::Search => {
+                if let Some(handle) = self.lane_tasks.search.take() {
+                    handle.abort();
+                }
+            }
+            Lane::Flag => {
+                if let Some(handle) = self.lane_tasks.flag.take() {
+                    handle.abort();
+                }
+            }
+            Lane::Mutation => {
+                if let Some(handle) = self.lane_tasks.mutation.take() {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    fn start_lane(&mut self, lane: Lane) -> u64 {
+        self.cancel_lane(lane);
+        self.diagnostics.next_op_id = self.diagnostics.next_op_id.saturating_add(1);
+        let op_id = self.diagnostics.next_op_id;
+        self.set_current_op_id(lane, op_id);
+        let epoch = self.bump_lane_epoch(lane);
+        log::debug!(
+            "lane-start lane={} epoch={} op_id={}",
+            Self::lane_name(lane),
+            epoch,
+            op_id
+        );
+        epoch
+    }
+
+    fn register_lane_task(&mut self, lane: Lane, handle: JoinHandle<()>) {
+        match lane {
+            Lane::Folder => self.lane_tasks.folder.push(handle),
+            Lane::Message => self.lane_tasks.message = Some(handle),
+            Lane::Search => self.lane_tasks.search = Some(handle),
+            Lane::Flag => self.lane_tasks.flag = Some(handle),
+            Lane::Mutation => self.lane_tasks.mutation = Some(handle),
+        }
+    }
+
+    fn current_selected_envelope_hash(&self) -> Option<u64> {
+        self.messages
+            .get(self.selected_message)
+            .map(|m| m.envelope_hash)
+    }
+
+    fn revalidate_selection(&mut self) {
+        let folder_len = self.active().folders.len();
+        if folder_len == 0 {
+            self.selected_folder = 0;
+            self.messages.clear();
+            self.selected_message = 0;
+            self.body_text = None;
+            self.collapsed_threads.clear();
+            self.visible_indices.clear();
+            self.thread_sizes.clear();
+            return;
+        }
+
+        if self.selected_folder >= folder_len {
+            self.selected_folder = folder_len - 1;
+        }
+
+        if self.messages.is_empty() {
+            self.selected_message = 0;
+            self.body_text = None;
+            self.attachment_info.clear();
+            self.image_protos.clear();
+            self.image_index = 0;
+            self.collapsed_threads.clear();
+            self.visible_indices.clear();
+            self.thread_sizes.clear();
+            return;
+        }
+
+        if self.selected_message >= self.messages.len() {
+            self.selected_message = self.messages.len() - 1;
+        }
+
+        self.recompute_visible();
+        if !self.visible_indices.is_empty()
+            && !self.visible_indices.contains(&self.selected_message)
+        {
+            self.selected_message = self.visible_indices[0];
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Channel interface (called from main loop)
     // -----------------------------------------------------------------------
@@ -377,22 +654,71 @@ impl App {
 
     /// Apply a background result to app state.
     pub fn apply(&mut self, result: BgResult) {
+        self.check_refresh_watchdog();
         match result {
-            BgResult::Folders(Ok(folders)) => {
-                self.status = format!("{} folders", folders.len());
-                let acct = &mut self.accounts[self.active_account];
-                acct.folders = folders;
-                acct.rebuild_folder_map();
-                if !acct.folders.is_empty() {
-                    self.spawn_load_messages();
+            BgResult::Folders {
+                account_idx,
+                lane_epoch,
+                result,
+            } => {
+                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Folder)
+                {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
+                    log::debug!(
+                        "stale-drop lane=folder active_account={} event_account={} expected_epoch={} got_epoch={} drift_count={}",
+                        self.active_account,
+                        account_idx,
+                        self.lane_epoch(Lane::Folder),
+                        lane_epoch,
+                        self.diagnostics.toc_drift_count
+                    );
+                    return;
+                }
+                match result {
+                    Ok(folders) => {
+                        self.status = format!("{} folders", folders.len());
+                        self.phase = Phase::Idle;
+                        let acct = &mut self.accounts[account_idx];
+                        acct.folders = folders;
+                        acct.rebuild_folder_map();
+                        if !acct.folders.is_empty() {
+                            self.spawn_load_messages();
+                        }
+                    }
+                    Err(e) => {
+                        self.phase = Phase::Error;
+                        self.status = format!("Folder error: {e}");
+                    }
                 }
             }
-            BgResult::Folders(Err(e)) => {
-                self.status = format!("Folder error: {e}");
-            }
-            BgResult::Messages { folder_idx, result } => {
-                // Only apply if user hasn't navigated away
+            BgResult::Messages {
+                account_idx,
+                lane_epoch,
+                folder_idx,
+                mailbox_hash,
+                result,
+            } => {
+                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Folder)
+                {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
+                    return;
+                }
                 if folder_idx != self.selected_folder {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
+                    return;
+                }
+                if self
+                    .active()
+                    .folders
+                    .get(folder_idx)
+                    .map(|f| f.mailbox_hash)
+                    != Some(mailbox_hash)
+                {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
                     return;
                 }
                 match result {
@@ -400,20 +726,48 @@ impl App {
                         msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                         let name = &self.active().folders[folder_idx].name;
                         self.status = format!("{name} — {} messages", msgs.len());
+                        self.phase = Phase::Idle;
                         self.messages = msgs;
                         self.selected_message = 0;
                         self.body_text = None;
                         self.collapsed_threads.clear();
                         self.recompute_visible();
                     }
-                    Err(e) => self.status = format!("Fetch error: {e}"),
+                    Err(e) => {
+                        self.phase = Phase::Error;
+                        self.status = format!("Fetch error: {e}");
+                    }
                 }
             }
-            BgResult::CachedMessages { folder_idx, result } => {
-                if folder_idx != self.selected_folder {
+            BgResult::CachedMessages {
+                account_idx,
+                lane_epoch,
+                folder_idx,
+                mailbox_hash,
+                result,
+            } => {
+                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Folder)
+                {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
                     return;
                 }
-                // Only apply cached results if we haven't already loaded from IMAP
+                if folder_idx != self.selected_folder {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
+                    return;
+                }
+                if self
+                    .active()
+                    .folders
+                    .get(folder_idx)
+                    .map(|f| f.mailbox_hash)
+                    != Some(mailbox_hash)
+                {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
+                    return;
+                }
                 if !self.messages.is_empty() {
                     return;
                 }
@@ -430,22 +784,28 @@ impl App {
                 }
             }
             BgResult::Body {
-                message_idx,
+                account_idx,
+                lane_epoch,
+                envelope_hash,
                 result,
             } => {
-                if message_idx != self.selected_message {
+                if account_idx != self.active_account
+                    || lane_epoch != self.lane_epoch(Lane::Message)
+                    || self.current_selected_envelope_hash() != Some(envelope_hash)
+                {
+                    self.diagnostics.toc_drift_count =
+                        self.diagnostics.toc_drift_count.saturating_add(1);
                     return;
                 }
                 match result {
                     Ok((body, attachments)) => {
+                        self.phase = Phase::Idle;
                         self.body_text = Some(body);
                         self.body_scroll = 0;
-                        // Build attachment summary
                         self.attachment_info = attachments
                             .iter()
                             .map(|a| (a.filename.clone(), a.mime_type.clone(), a.data.len()))
                             .collect();
-                        // Create image protocols for all image attachments
                         self.image_protos.clear();
                         self.image_index = 0;
                         if let Some(picker) = &self.picker {
@@ -461,11 +821,16 @@ impl App {
                                 }
                             }
                         }
-                        if let Some(msg) = self.messages.get(message_idx) {
+                        if let Some(msg) = self
+                            .messages
+                            .iter()
+                            .find(|m| m.envelope_hash == envelope_hash)
+                        {
                             self.status = msg.subject.clone();
                         }
                     }
                     Err(e) => {
+                        self.phase = Phase::Error;
                         self.body_text = Some(format!("Error: {e}"));
                         self.attachment_info.clear();
                         self.image_protos.clear();
@@ -475,13 +840,18 @@ impl App {
                 }
             }
             BgResult::FlagOp {
+                account_idx,
+                lane_epoch,
                 envelope_hash,
                 was_read,
                 was_starred,
                 result,
             } => {
+                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Flag) {
+                    return;
+                }
                 if let Err(e) = result {
-                    // Revert optimistic flag toggle
+                    self.phase = Phase::Error;
                     if let Some(msg) = self
                         .messages
                         .iter_mut()
@@ -494,37 +864,97 @@ impl App {
                 }
             }
             BgResult::MoveOp {
+                account_idx,
+                lane_epoch,
                 envelope_hash: _,
+                source_mailbox_hash,
+                destination_name,
+                reconciled_source_toc,
+                retryable,
+                postcondition_failed,
                 message,
                 result,
             } => {
-                if let Err(e) = result {
-                    // Revert optimistic removal — reinsert the message
-                    if let Some((idx, msg)) = *message {
-                        let insert_at = idx.min(self.messages.len());
-                        self.messages.insert(insert_at, msg);
+                if account_idx != self.active_account
+                    || lane_epoch != self.lane_epoch(Lane::Mutation)
+                {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        self.phase = Phase::Idle;
+                        self.status = format!("Moved to {destination_name}.");
                     }
-                    self.status = format!("Move error: {e}");
+                    Err(e) => {
+                        self.phase = Phase::Error;
+                        if let Some(mut msgs) = reconciled_source_toc {
+                            let selected_mailbox_hash = self
+                                .active()
+                                .folders
+                                .get(self.selected_folder)
+                                .map(|f| f.mailbox_hash);
+                            if selected_mailbox_hash == Some(source_mailbox_hash) {
+                                msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                                self.messages = msgs;
+                                self.selected_message = 0;
+                                self.body_text = None;
+                                self.collapsed_threads.clear();
+                            }
+                        } else if let Some((idx, msg)) = *message {
+                            let insert_at = idx.min(self.messages.len());
+                            self.messages.insert(insert_at, msg);
+                        }
+
+                        if postcondition_failed {
+                            self.diagnostics.postcondition_failure_count = self
+                                .diagnostics
+                                .postcondition_failure_count
+                                .saturating_add(1);
+                        }
+                        if retryable {
+                            self.status = format!("Move error (retryable): {e}");
+                        } else {
+                            self.status = format!("Move error: {e}");
+                        }
+                    }
                 }
             }
-            BgResult::SearchResults(result) => match result {
-                Ok(mut msgs) => {
-                    msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-                    self.status = format!("Search: {} results", msgs.len());
-                    self.messages = msgs;
-                    self.selected_message = 0;
-                    self.body_text = None;
-                    self.collapsed_threads.clear();
-                    self.recompute_visible();
+            BgResult::SearchResults {
+                account_idx,
+                lane_epoch,
+                result,
+            } => {
+                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Search)
+                {
+                    return;
                 }
-                Err(e) => self.status = format!("Search error: {e}"),
-            },
+                match result {
+                    Ok(mut msgs) => {
+                        msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                        self.phase = Phase::Idle;
+                        self.status = format!("Search: {} results", msgs.len());
+                        self.messages = msgs;
+                        self.selected_message = 0;
+                        self.body_text = None;
+                        self.collapsed_threads.clear();
+                        self.recompute_visible();
+                    }
+                    Err(e) => {
+                        self.phase = Phase::Error;
+                        self.status = format!("Search error: {e}");
+                    }
+                }
+            }
             BgResult::SendResult(result) => match result {
                 Ok(()) => {
+                    self.phase = Phase::Idle;
                     self.compose = None;
                     self.status = "Message sent.".into();
                 }
-                Err(e) => self.status = format!("Send error: {e}"),
+                Err(e) => {
+                    self.phase = Phase::Error;
+                    self.status = format!("Send error: {e}");
+                }
             },
             BgResult::ImapEvent {
                 account_idx,
@@ -541,14 +971,15 @@ impl App {
                 match kind {
                     ImapEventKind::NewMail | ImapEventKind::Rescan => {
                         if is_active && current_mbox == Some(mailbox_hash) {
+                            self.phase = Phase::Refreshing;
+                            self.begin_refresh_watchdog();
                             self.status = "New mail — refreshing…".into();
                             self.spawn_load_messages();
                         }
                     }
                     ImapEventKind::Remove(envelope_hash) => {
                         if is_active && current_mbox == Some(mailbox_hash) {
-                            self.messages
-                                .retain(|m| m.envelope_hash != envelope_hash);
+                            self.messages.retain(|m| m.envelope_hash != envelope_hash);
                             if self.selected_message >= self.messages.len()
                                 && !self.messages.is_empty()
                             {
@@ -564,32 +995,39 @@ impl App {
                 }
             }
         }
+        if self.phase != Phase::Refreshing {
+            self.clear_refresh_watchdog();
+        }
+        self.revalidate_selection();
     }
 
     // -----------------------------------------------------------------------
     // Spawn background IMAP tasks
     // -----------------------------------------------------------------------
 
-    fn spawn_load_folders(&self) {
+    fn spawn_load_folders(&mut self) {
         let session = match self.active_session() {
             Some(s) => s,
             None => return,
         };
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Folder);
+        self.phase = Phase::Loading;
         let tx = self.bg_tx.clone();
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
-        tokio::spawn(async move {
-            let result = session
-                .fetch_folders()
-                .await
-                .map_err(|e| e.to_string());
+        let handle = tokio::spawn(async move {
+            let result = session.fetch_folders().await.map_err(|e| e.to_string());
             if let Ok(ref folders) = result {
-                let _ = cache
-                    .save_folders(account_id, folders.clone())
-                    .await;
+                let _ = cache.save_folders(account_id, folders.clone()).await;
             }
-            let _ = tx.send(BgResult::Folders(result));
+            let _ = tx.send(BgResult::Folders {
+                account_idx,
+                lane_epoch,
+                result,
+            });
         });
+        self.register_lane_task(Lane::Folder, handle);
     }
 
     fn spawn_load_messages(&mut self) {
@@ -601,7 +1039,20 @@ impl App {
         let mbox_hash_raw = folder.mailbox_hash;
         let mbox_hash = MailboxHash(mbox_hash_raw);
         let folder_idx = self.selected_folder;
-        self.status = format!("Loading {}…", folder.name);
+        let folder_name = folder.name.clone();
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Folder);
+        self.phase = if self.messages.is_empty() {
+            Phase::Loading
+        } else {
+            Phase::Refreshing
+        };
+        if self.phase == Phase::Refreshing {
+            self.begin_refresh_watchdog();
+        } else {
+            self.clear_refresh_watchdog();
+        }
+        self.status = format!("Loading {folder_name}…");
         // Clear messages so cached results can display
         self.messages.clear();
         self.body_text = None;
@@ -618,18 +1069,22 @@ impl App {
         let cache2 = cache.clone();
         let account_id2 = account_id.clone();
         let tx2 = tx.clone();
-        tokio::spawn(async move {
+        let cache_handle = tokio::spawn(async move {
             let result = cache2
                 .load_messages(account_id2, mbox_hash_raw, 200, 0)
                 .await;
             let _ = tx2.send(BgResult::CachedMessages {
+                account_idx,
+                lane_epoch,
                 folder_idx,
+                mailbox_hash: mbox_hash_raw,
                 result,
             });
         });
+        self.register_lane_task(Lane::Folder, cache_handle);
 
         // IMAP fetch (authoritative, overwrites cache)
-        tokio::spawn(async move {
+        let imap_handle = tokio::spawn(async move {
             let result = session
                 .fetch_messages(mbox_hash)
                 .await
@@ -639,8 +1094,15 @@ impl App {
                     .save_messages(account_id, mbox_hash_raw, msgs.clone())
                     .await;
             }
-            let _ = tx.send(BgResult::Messages { folder_idx, result });
+            let _ = tx.send(BgResult::Messages {
+                account_idx,
+                lane_epoch,
+                folder_idx,
+                mailbox_hash: mbox_hash_raw,
+                result,
+            });
         });
+        self.register_lane_task(Lane::Folder, imap_handle);
     }
 
     fn spawn_load_body(&mut self) {
@@ -650,7 +1112,9 @@ impl App {
         let msg = &self.messages[self.selected_message];
         let env_hash_raw = msg.envelope_hash;
         let env_hash = neverlight_mail_core::EnvelopeHash(env_hash_raw);
-        let message_idx = self.selected_message;
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Message);
+        self.phase = Phase::Loading;
         self.status = "Loading body…".into();
 
         let session = match self.active_session() {
@@ -660,7 +1124,7 @@ impl App {
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Try cache first
             if let Ok(Some((md_body, plain_body, attachments))) =
                 cache.load_body(account_id.clone(), env_hash_raw).await
@@ -671,7 +1135,9 @@ impl App {
                     md_body
                 };
                 let _ = tx.send(BgResult::Body {
-                    message_idx,
+                    account_idx,
+                    lane_epoch,
+                    envelope_hash: env_hash_raw,
                     result: Ok((body, attachments)),
                 });
                 return;
@@ -706,10 +1172,13 @@ impl App {
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(BgResult::Body {
-                message_idx,
+                account_idx,
+                lane_epoch,
+                envelope_hash: env_hash_raw,
                 result: rendered,
             });
         });
+        self.register_lane_task(Lane::Message, handle);
     }
 
     // -----------------------------------------------------------------------
@@ -740,10 +1209,12 @@ impl App {
             Some(s) => s,
             None => return,
         };
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Flag);
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Update cache optimistically
             let flags = store::flags_to_u8(new_read, was_starred);
             let op = if new_read { "mark-read" } else { "mark-unread" };
@@ -771,12 +1242,15 @@ impl App {
             }
 
             let _ = tx.send(BgResult::FlagOp {
+                account_idx,
+                lane_epoch,
                 envelope_hash,
                 was_read,
                 was_starred,
                 result,
             });
         });
+        self.register_lane_task(Lane::Flag, handle);
     }
 
     fn toggle_star(&mut self) {
@@ -803,10 +1277,12 @@ impl App {
             Some(s) => s,
             None => return,
         };
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Flag);
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let flags = store::flags_to_u8(was_read, new_starred);
             let op = if new_starred { "star" } else { "unstar" };
             let _ = cache
@@ -832,12 +1308,15 @@ impl App {
             }
 
             let _ = tx.send(BgResult::FlagOp {
+                account_idx,
+                lane_epoch,
                 envelope_hash,
                 was_read,
                 was_starred,
                 result,
             });
         });
+        self.register_lane_task(Lane::Flag, handle);
     }
 
     fn move_to_folder(&mut self, target_name: &str) {
@@ -876,11 +1355,14 @@ impl App {
             Some(s) => s,
             None => return,
         };
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Mutation);
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
         let saved_msg = msg.clone();
-        tokio::spawn(async move {
+        let destination_name = target_name.to_string();
+        let handle = tokio::spawn(async move {
             // Cache: mark as pending move
             let _ = cache
                 .update_flags(
@@ -891,7 +1373,7 @@ impl App {
                 )
                 .await;
 
-            let result = session
+            let move_result = session
                 .move_messages(
                     EnvelopeHash(envelope_hash),
                     MailboxHash(source_hash),
@@ -899,18 +1381,59 @@ impl App {
                 )
                 .await;
 
-            if result.is_ok() {
-                let _ = cache
-                    .remove_message(account_id.clone(), envelope_hash)
-                    .await;
+            let mut reconciled_source_toc = None;
+            let mut retryable = false;
+            let mut postcondition_failed = false;
+            let result = if move_result.is_ok() {
+                match session.fetch_messages(MailboxHash(source_hash)).await {
+                    Ok(source_msgs) => {
+                        let still_in_source =
+                            source_msgs.iter().any(|m| m.envelope_hash == envelope_hash);
+                        if still_in_source {
+                            retryable = true;
+                            postcondition_failed = true;
+                            let _ = cache
+                                .save_messages(account_id.clone(), source_hash, source_msgs.clone())
+                                .await;
+                            let _ = cache
+                                .revert_pending_op(account_id.clone(), envelope_hash)
+                                .await;
+                            reconciled_source_toc = Some(source_msgs);
+                            Err(
+                                "Postcondition failed: source mailbox still contains message"
+                                    .into(),
+                            )
+                        } else {
+                            let _ = cache
+                                .remove_message(account_id.clone(), envelope_hash)
+                                .await;
+                            Ok(())
+                        }
+                    }
+                    Err(e) => {
+                        retryable = true;
+                        let _ = cache
+                            .revert_pending_op(account_id.clone(), envelope_hash)
+                            .await;
+                        Err(format!("Move verification failed: {e}"))
+                    }
+                }
             } else {
                 let _ = cache
                     .revert_pending_op(account_id.clone(), envelope_hash)
                     .await;
-            }
+                move_result
+            };
 
             let _ = tx.send(BgResult::MoveOp {
+                account_idx,
+                lane_epoch,
                 envelope_hash,
+                source_mailbox_hash: source_hash,
+                destination_name,
+                reconciled_source_toc,
+                retryable,
+                postcondition_failed,
                 message: Box::new(if result.is_err() {
                     Some((idx, saved_msg))
                 } else {
@@ -919,20 +1442,29 @@ impl App {
                 result,
             });
         });
+        self.register_lane_task(Lane::Mutation, handle);
     }
 
     // -----------------------------------------------------------------------
     // Search
     // -----------------------------------------------------------------------
 
-    fn spawn_search(&self) {
+    fn spawn_search(&mut self) {
         let query = self.search_query.clone();
+        let account_idx = self.active_account;
+        let lane_epoch = self.start_lane(Lane::Search);
+        self.phase = Phase::Searching;
         let cache = self.cache.clone();
         let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result = cache.search(query).await;
-            let _ = tx.send(BgResult::SearchResults(result));
+            let _ = tx.send(BgResult::SearchResults {
+                account_idx,
+                lane_epoch,
+                result,
+            });
         });
+        self.register_lane_task(Lane::Search, handle);
     }
 
     fn exit_search(&mut self) {
@@ -983,8 +1515,7 @@ impl App {
                         format!("Fwd: {}", msg.subject)
                     };
                     if let Some(body) = &self.body_text {
-                        let fwd =
-                            compose::forward_body(body, &msg.from, &msg.date, &msg.subject);
+                        let fwd = compose::forward_body(body, &msg.from, &msg.date, &msg.subject);
                         state.body = ratatui_textarea::TextArea::new(
                             std::iter::once(String::new())
                                 .chain(std::iter::once(String::new()))
@@ -1067,12 +1598,16 @@ impl App {
             _ => {
                 match state.active_field {
                     ComposeField::To => match key.code {
-                        KeyCode::Backspace => { state.to.pop(); }
+                        KeyCode::Backspace => {
+                            state.to.pop();
+                        }
                         KeyCode::Char(c) => state.to.push(c),
                         _ => {}
                     },
                     ComposeField::Subject => match key.code {
-                        KeyCode::Backspace => { state.subject.pop(); }
+                        KeyCode::Backspace => {
+                            state.subject.pop();
+                        }
                         KeyCode::Char(c) => state.subject.push(c),
                         _ => {}
                     },
@@ -1143,21 +1678,19 @@ impl App {
                     } else {
                         self.spawn_load_messages();
                     }
-                    self.status = format!(
-                        "Account: {}",
-                        self.active().config.label
-                    );
+                    self.phase = Phase::Loading;
+                    self.status = format!("Account: {}", self.active().config.label);
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                if self.focus == Focus::Body && self.image_protos.len() > 1
-                    && self.image_index > 0
+                if self.focus == Focus::Body && self.image_protos.len() > 1 && self.image_index > 0
                 {
                     self.image_index -= 1;
                 }
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                if self.focus == Focus::Body && self.image_protos.len() > 1
+                if self.focus == Focus::Body
+                    && self.image_protos.len() > 1
                     && self.image_index + 1 < self.image_protos.len()
                 {
                     self.image_index += 1;
@@ -1175,6 +1708,7 @@ impl App {
                 if self.search_query.is_empty() {
                     self.exit_search();
                 } else {
+                    self.phase = Phase::Searching;
                     self.status = format!("Searching: {}…", self.search_query);
                     self.spawn_search();
                     // Exit search input mode so user can navigate results
@@ -1260,9 +1794,8 @@ impl App {
         }
 
         let lr = &self.layout_rects;
-        let in_rect = |r: &Rect| {
-            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-        };
+        let in_rect =
+            |r: &Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
 
         match kind {
             MouseEventKind::Down(_) => {
@@ -1270,8 +1803,7 @@ impl App {
                     self.focus = Focus::Folders;
                     // Row within the pane (subtract border top)
                     let local_row = row.saturating_sub(lr.folders.y + 1) as usize;
-                    if local_row < self.active().folders.len()
-                        && local_row != self.selected_folder
+                    if local_row < self.active().folders.len() && local_row != self.selected_folder
                     {
                         self.selected_folder = local_row;
                         self.spawn_load_messages();

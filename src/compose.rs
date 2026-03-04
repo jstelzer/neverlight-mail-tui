@@ -82,10 +82,7 @@ mod tests {
     #[test]
     fn quote_body_prefixes_lines() {
         let result = quote_body("line 1\nline 2", "Alice", "2026-01-15");
-        assert_eq!(
-            result,
-            "On 2026-01-15, Alice wrote:\n> line 1\n> line 2\n"
-        );
+        assert_eq!(result, "On 2026-01-15, Alice wrote:\n> line 1\n> line 2\n");
     }
 
     #[test]

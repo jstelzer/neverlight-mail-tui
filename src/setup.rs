@@ -52,9 +52,7 @@ fn run_form(
                 }
                 KeyCode::Tab => SetupInput::NextField,
                 KeyCode::BackTab => SetupInput::PrevField,
-                KeyCode::Char(' ') if model.active_field.is_toggle() => {
-                    SetupInput::Toggle
-                }
+                KeyCode::Char(' ') if model.active_field.is_toggle() => SetupInput::Toggle,
                 KeyCode::Char(c) => SetupInput::InsertChar(c),
                 KeyCode::Backspace => SetupInput::Backspace,
                 _ => continue,
@@ -76,7 +74,10 @@ fn render(frame: &mut Frame, model: &SetupModel) {
     let area = frame.area();
 
     // Center a dialog box
-    let is_password_only = matches!(model.request, neverlight_mail_core::setup::SetupRequest::PasswordOnly { .. });
+    let is_password_only = matches!(
+        model.request,
+        neverlight_mail_core::setup::SetupRequest::PasswordOnly { .. }
+    );
     let dialog_w = 60u16.min(area.width.saturating_sub(4));
     let dialog_h = if is_password_only { 10u16 } else { 28u16 }.min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(dialog_w)) / 2;
@@ -109,7 +110,13 @@ fn render(frame: &mut Frame, model: &SetupModel) {
     }
 
     // STARTTLS toggle
-    render_toggle_field(&mut lines, model, FieldId::Starttls, "STARTTLS", model.starttls);
+    render_toggle_field(
+        &mut lines,
+        model,
+        FieldId::Starttls,
+        "STARTTLS",
+        model.starttls,
+    );
 
     // SMTP overrides section (only for Full/Edit)
     if !is_password_only {
@@ -129,7 +136,13 @@ fn render(frame: &mut Frame, model: &SetupModel) {
             render_text_field(&mut lines, model, *field, label, field_w);
         }
 
-        render_toggle_field(&mut lines, model, FieldId::SmtpStarttls, "SMTP TLS", model.smtp_starttls);
+        render_toggle_field(
+            &mut lines,
+            model,
+            FieldId::SmtpStarttls,
+            "SMTP TLS",
+            model.smtp_starttls,
+        );
     }
 
     lines.push(Line::from(""));
@@ -227,9 +240,6 @@ fn render_toggle_field<'a>(
     lines.push(Line::from(vec![
         Span::styled(format!("    {}: ", label), label_style),
         Span::styled(format!("[{}]", check), value_style),
-        Span::styled(
-            " (Space to toggle)",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(" (Space to toggle)", Style::default().fg(Color::DarkGray)),
     ]));
 }

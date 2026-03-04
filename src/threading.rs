@@ -121,11 +121,11 @@ mod tests {
     #[test]
     fn mixed_threads_and_standalone() {
         let messages = vec![
-            msg(Some(1), 0),  // 0: thread 1 root
-            msg(Some(1), 1),  // 1: thread 1 child
-            msg(None, 0),     // 2: standalone
-            msg(Some(2), 0),  // 3: thread 2 root
-            msg(Some(2), 1),  // 4: thread 2 child
+            msg(Some(1), 0), // 0: thread 1 root
+            msg(Some(1), 1), // 1: thread 1 child
+            msg(None, 0),    // 2: standalone
+            msg(Some(2), 0), // 3: thread 2 root
+            msg(Some(2), 1), // 4: thread 2 child
         ];
         // Collapse thread 1 only
         let collapsed = HashSet::from([1]);
