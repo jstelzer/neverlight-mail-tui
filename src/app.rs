@@ -92,6 +92,11 @@ pub enum BgResult {
         account_idx: usize,
         error: Option<String>,
     },
+    /// Reconnect attempt completed
+    Reconnected {
+        account_idx: usize,
+        result: Result<Arc<ImapSession>, String>,
+    },
 }
 
 #[derive(Debug)]
@@ -110,9 +115,24 @@ pub struct AccountState {
     pub session: Option<Arc<ImapSession>>,
     pub folders: Vec<Folder>,
     pub folder_map: HashMap<String, u64>,
+    /// Consecutive reconnect failures (reset on success).
+    pub reconnect_attempts: u32,
+    /// Last error message for diagnostics.
+    pub last_error: Option<String>,
 }
 
 impl AccountState {
+    /// Backoff duration for reconnect retries: 5s, 15s, 30s, 60s cap.
+    pub fn reconnect_backoff(&self) -> Duration {
+        let secs = match self.reconnect_attempts {
+            0 => 5,
+            1 => 15,
+            2 => 30,
+            _ => 60,
+        };
+        Duration::from_secs(secs)
+    }
+
     fn rebuild_folder_map(&mut self) {
         self.folder_map = self
             .folders
@@ -285,6 +305,8 @@ impl App {
                 session,
                 folders: Vec::new(),
                 folder_map: HashMap::new(),
+                reconnect_attempts: 0,
+                last_error: None,
             });
         }
 
@@ -327,50 +349,76 @@ impl App {
     }
 
     fn spawn_watchers(&self) {
-        for (idx, acct) in self.accounts.iter().enumerate() {
-            let session = match &acct.session {
-                Some(s) => Arc::clone(s),
-                None => continue,
-            };
-            let tx = self.bg_tx.clone();
-            tokio::spawn(async move {
-                let stream = match session.watch().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(BgResult::WatchEnded {
-                            account_idx: idx,
-                            error: Some(e),
-                        });
-                        return;
-                    }
-                };
-                futures::pin_mut!(stream);
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(neverlight_mail_core::BackendEvent::Refresh(rev)) => {
-                            let mailbox_hash = rev.mailbox_hash.0;
-                            let kind = match rev.kind {
-                                RefreshEventKind::Create(_) => ImapEventKind::NewMail,
-                                RefreshEventKind::Remove(hash) => ImapEventKind::Remove(hash.0),
-                                RefreshEventKind::Rescan => ImapEventKind::Rescan,
-                                _ => continue,
-                            };
-                            let _ = tx.send(BgResult::ImapEvent {
-                                account_idx: idx,
-                                mailbox_hash,
-                                kind,
-                            });
-                        }
-                        Err(_) => continue,
-                        _ => {}
-                    }
-                }
-                let _ = tx.send(BgResult::WatchEnded {
-                    account_idx: idx,
-                    error: None,
-                });
-            });
+        for idx in 0..self.accounts.len() {
+            self.spawn_watcher_for(idx);
         }
+    }
+
+    fn spawn_watcher_for(&self, idx: usize) {
+        let session = match &self.accounts[idx].session {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let stream = match session.watch().await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(BgResult::WatchEnded {
+                        account_idx: idx,
+                        error: Some(e),
+                    });
+                    return;
+                }
+            };
+            futures::pin_mut!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(neverlight_mail_core::BackendEvent::Refresh(rev)) => {
+                        let mailbox_hash = rev.mailbox_hash.0;
+                        let kind = match rev.kind {
+                            RefreshEventKind::Create(_) => ImapEventKind::NewMail,
+                            RefreshEventKind::Remove(hash) => ImapEventKind::Remove(hash.0),
+                            RefreshEventKind::Rescan => ImapEventKind::Rescan,
+                            _ => continue,
+                        };
+                        let _ = tx.send(BgResult::ImapEvent {
+                            account_idx: idx,
+                            mailbox_hash,
+                            kind,
+                        });
+                    }
+                    Err(_) => continue,
+                    _ => {}
+                }
+            }
+            let _ = tx.send(BgResult::WatchEnded {
+                account_idx: idx,
+                error: None,
+            });
+        });
+    }
+
+    fn spawn_reconnect(&self, account_idx: usize) {
+        let acct = &self.accounts[account_idx];
+        let delay = acct.reconnect_backoff();
+        let config = acct.config.clone();
+        let tx = self.bg_tx.clone();
+        log::info!(
+            "Scheduling reconnect for '{}' in {}s (attempt {})",
+            config.label,
+            delay.as_secs(),
+            acct.reconnect_attempts,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let imap_config = config.to_imap_config();
+            let result = ImapSession::connect(imap_config).await;
+            let _ = tx.send(BgResult::Reconnected {
+                account_idx,
+                result,
+            });
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -689,6 +737,12 @@ impl App {
                     Err(e) => {
                         self.phase = Phase::Error;
                         self.status = format!("Folder error: {e}");
+                        log::error!("Folder sync failed for '{}': {e} — dropping session", self.accounts[account_idx].config.label);
+                        let acct = &mut self.accounts[account_idx];
+                        acct.last_error = Some(e);
+                        acct.session = None;
+                        acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
+                        self.spawn_reconnect(account_idx);
                     }
                 }
             }
@@ -736,6 +790,12 @@ impl App {
                     Err(e) => {
                         self.phase = Phase::Error;
                         self.status = format!("Fetch error: {e}");
+                        log::error!("Message sync failed for '{}': {e} — dropping session", self.accounts[account_idx].config.label);
+                        let acct = &mut self.accounts[account_idx];
+                        acct.last_error = Some(e);
+                        acct.session = None;
+                        acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
+                        self.spawn_reconnect(account_idx);
                     }
                 }
             }
@@ -990,8 +1050,52 @@ impl App {
                 }
             }
             BgResult::WatchEnded { account_idx, error } => {
-                if let Some(e) = error {
-                    log::warn!("Watch ended for account {account_idx}: {e}");
+                let label = self.accounts.get(account_idx)
+                    .map(|a| a.config.label.as_str())
+                    .unwrap_or("unknown");
+                match &error {
+                    Some(e) => log::warn!("Watch ended for '{}': {e}", label),
+                    None => log::info!("Watch stream ended for '{}'", label),
+                }
+                if let Some(acct) = self.accounts.get_mut(account_idx) {
+                    let msg = error.unwrap_or_else(|| "Connection lost".into());
+                    acct.last_error = Some(msg);
+                    acct.session = None;
+                    acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
+                    self.spawn_reconnect(account_idx);
+                }
+            }
+            BgResult::Reconnected { account_idx, result } => {
+                match result {
+                    Ok(session) => {
+                        if let Some(acct) = self.accounts.get_mut(account_idx) {
+                            log::info!(
+                                "Reconnected '{}' after {} attempt(s)",
+                                acct.config.label,
+                                acct.reconnect_attempts,
+                            );
+                            acct.session = Some(session);
+                            acct.reconnect_attempts = 0;
+                            acct.last_error = None;
+                            self.spawn_watcher_for(account_idx);
+                            if account_idx == self.active_account {
+                                self.spawn_load_folders();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(acct) = self.accounts.get_mut(account_idx) {
+                            acct.last_error = Some(e.clone());
+                            acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
+                            log::error!(
+                                "Reconnect failed for '{}' (attempt {}): {}",
+                                acct.config.label,
+                                acct.reconnect_attempts,
+                                e,
+                            );
+                            self.spawn_reconnect(account_idx);
+                        }
+                    }
                 }
             }
         }

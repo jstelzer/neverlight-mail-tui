@@ -43,6 +43,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_folders(frame: &mut Frame, app: &App, area: Rect) {
+    // Split: folder list on top, connection info at bottom
+    let conn_height = (app.accounts.len() as u16 + 2).min(area.height); // 1 per account + border
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(conn_height)])
+        .split(area);
+
+    let conn_area = chunks[1];
+
+    // -- Folder list --
     let items: Vec<ListItem> = app
         .active_folders()
         .iter()
@@ -74,7 +84,51 @@ fn render_folders(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut state = ListState::default();
     state.select(Some(app.selected_folder));
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    // -- Connection info --
+    render_conn_info(frame, app, conn_area);
+}
+
+fn render_conn_info(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, acct) in app.accounts.iter().enumerate() {
+        let active = i == app.active_account;
+        let (symbol, style) = if acct.session.is_some() {
+            ("●", Style::default().fg(Color::Green))
+        } else if acct.reconnect_attempts > 0 {
+            ("↻", Style::default().fg(Color::Yellow))
+        } else {
+            ("○", Style::default().fg(Color::Red))
+        };
+
+        let mut spans = vec![
+            Span::styled(symbol, style),
+            Span::raw(" "),
+        ];
+
+        let label_style = if active {
+            Style::default().bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(&acct.config.label, label_style));
+
+        if acct.reconnect_attempts > 0 {
+            spans.push(Span::styled(
+                format!(" retry#{}", acct.reconnect_attempts),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
