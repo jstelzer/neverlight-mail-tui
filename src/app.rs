@@ -20,6 +20,27 @@ use ratatui_image::thread::{ResizeRequest, ThreadProtocol};
 use crate::compose::{self, ComposeField, ComposeMode, ComposeState};
 
 // ---------------------------------------------------------------------------
+// Error classification helpers
+// ---------------------------------------------------------------------------
+
+fn error_indicates_dead_session(e: &str) -> bool {
+    let lower = e.to_lowercase();
+    lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("not connected")
+        || lower.contains("connection refused")
+        || lower.contains("eof")
+}
+
+fn body_error_indicates_stale_message(e: &str) -> bool {
+    let lower = e.to_lowercase();
+    lower.contains("not found")
+        || lower.contains("deleted before you requested")
+        || lower.contains("local cache")
+}
+
+// ---------------------------------------------------------------------------
 // Background task results
 // ---------------------------------------------------------------------------
 
@@ -84,12 +105,14 @@ pub enum BgResult {
     /// IDLE event: server notified of new/changed/removed messages
     ImapEvent {
         account_idx: usize,
+        watch_generation: u64,
         mailbox_hash: u64,
         kind: ImapEventKind,
     },
     /// Watch stream ended or errored
     WatchEnded {
         account_idx: usize,
+        watch_generation: u64,
         error: Option<String>,
     },
     /// Reconnect attempt completed
@@ -119,6 +142,8 @@ pub struct AccountState {
     pub reconnect_attempts: u32,
     /// Last error message for diagnostics.
     pub last_error: Option<String>,
+    /// Monotonic generation counter for watcher identity.
+    pub watch_generation: u64,
 }
 
 impl AccountState {
@@ -307,6 +332,7 @@ impl App {
                 folder_map: HashMap::new(),
                 reconnect_attempts: 0,
                 last_error: None,
+                watch_generation: 0,
             });
         }
 
@@ -348,17 +374,20 @@ impl App {
         Ok(app)
     }
 
-    fn spawn_watchers(&self) {
+    fn spawn_watchers(&mut self) {
         for idx in 0..self.accounts.len() {
             self.spawn_watcher_for(idx);
         }
     }
 
-    fn spawn_watcher_for(&self, idx: usize) {
+    fn spawn_watcher_for(&mut self, idx: usize) {
         let session = match &self.accounts[idx].session {
             Some(s) => Arc::clone(s),
             None => return,
         };
+        self.accounts[idx].watch_generation =
+            self.accounts[idx].watch_generation.saturating_add(1);
+        let generation = self.accounts[idx].watch_generation;
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let stream = match session.watch().await {
@@ -366,6 +395,7 @@ impl App {
                 Err(e) => {
                     let _ = tx.send(BgResult::WatchEnded {
                         account_idx: idx,
+                        watch_generation: generation,
                         error: Some(e),
                     });
                     return;
@@ -384,6 +414,7 @@ impl App {
                         };
                         let _ = tx.send(BgResult::ImapEvent {
                             account_idx: idx,
+                            watch_generation: generation,
                             mailbox_hash,
                             kind,
                         });
@@ -394,9 +425,22 @@ impl App {
             }
             let _ = tx.send(BgResult::WatchEnded {
                 account_idx: idx,
+                watch_generation: generation,
                 error: None,
             });
         });
+    }
+
+    fn drop_session_and_reconnect(&mut self, account_idx: usize, reason: &str) {
+        let acct = &mut self.accounts[account_idx];
+        log::warn!(
+            "Dropping session for '{}' (reason: {reason})",
+            acct.config.label,
+        );
+        acct.session = None;
+        acct.last_error = Some(format!("Session lost: {reason}"));
+        acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
+        self.spawn_reconnect(account_idx);
     }
 
     fn spawn_reconnect(&self, account_idx: usize) {
@@ -781,6 +825,22 @@ impl App {
                         let name = &self.active().folders[folder_idx].name;
                         self.status = format!("{name} — {} messages", msgs.len());
                         self.phase = Phase::Idle;
+                        // Reconcile sidebar unread count from actual message flags
+                        let unread = msgs.iter().filter(|m| !m.is_read).count() as u32;
+                        if let Some(folder) = self.accounts[account_idx]
+                            .folders
+                            .get_mut(folder_idx)
+                        {
+                            if folder.unread_count != unread {
+                                log::debug!(
+                                    "Reconciling unread for '{}': {} → {}",
+                                    folder.name,
+                                    folder.unread_count,
+                                    unread,
+                                );
+                                folder.unread_count = unread;
+                            }
+                        }
                         self.messages = msgs;
                         self.selected_message = 0;
                         self.body_text = None;
@@ -890,6 +950,47 @@ impl App {
                         }
                     }
                     Err(e) => {
+                        // Stale message: cached TOC has it but server doesn't.
+                        // Evict from the list and trigger a refresh to reconcile.
+                        if body_error_indicates_stale_message(&e) {
+                            log::warn!(
+                                "Evicting stale message {} (body error: {e})",
+                                envelope_hash,
+                            );
+                            if let Some(pos) = self
+                                .messages
+                                .iter()
+                                .position(|m| m.envelope_hash == envelope_hash)
+                            {
+                                self.messages.remove(pos);
+                                if self.selected_message >= self.messages.len()
+                                    && !self.messages.is_empty()
+                                {
+                                    self.selected_message = self.messages.len() - 1;
+                                }
+                                self.recompute_visible();
+                            }
+                            // Evict from cache
+                            let cache = self.cache.clone();
+                            let account_id = self.active_account_id();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    cache.remove_message(account_id, envelope_hash).await
+                                {
+                                    log::warn!(
+                                        "Failed to evict stale message from cache: {e}"
+                                    );
+                                }
+                            });
+                            self.body_text = None;
+                            self.attachment_info.clear();
+                            self.image_protos.clear();
+                            self.image_index = 0;
+                            self.status =
+                                "Message no longer exists on server".into();
+                            self.spawn_load_messages();
+                            return;
+                        }
                         self.phase = Phase::Error;
                         self.body_text = Some(format!("Error: {e}"));
                         self.attachment_info.clear();
@@ -921,6 +1022,11 @@ impl App {
                         msg.is_starred = was_starred;
                     }
                     self.status = format!("Flag error: {e}");
+                    if self.accounts[account_idx].session.is_none()
+                        || error_indicates_dead_session(&e)
+                    {
+                        self.drop_session_and_reconnect(account_idx, "flag-failed");
+                    }
                 }
             }
             BgResult::MoveOp {
@@ -976,6 +1082,11 @@ impl App {
                         } else {
                             self.status = format!("Move error: {e}");
                         }
+                        if self.accounts[account_idx].session.is_none()
+                            || error_indicates_dead_session(&e)
+                        {
+                            self.drop_session_and_reconnect(account_idx, "move-failed");
+                        }
                     }
                 }
             }
@@ -1018,9 +1129,22 @@ impl App {
             },
             BgResult::ImapEvent {
                 account_idx,
+                watch_generation,
                 mailbox_hash,
                 kind,
             } => {
+                // Stale watcher — ignore events from a superseded watch stream.
+                if let Some(acct) = self.accounts.get(account_idx) {
+                    if watch_generation != acct.watch_generation {
+                        log::debug!(
+                            "Ignoring stale ImapEvent for '{}' (gen {} != current {})",
+                            acct.config.label,
+                            watch_generation,
+                            acct.watch_generation,
+                        );
+                        return;
+                    }
+                }
                 // Only act if event is for the active account and current folder
                 let is_active = account_idx == self.active_account;
                 let current_mbox = self
@@ -1049,15 +1173,22 @@ impl App {
                     }
                 }
             }
-            BgResult::WatchEnded { account_idx, error } => {
-                let label = self.accounts.get(account_idx)
-                    .map(|a| a.config.label.as_str())
-                    .unwrap_or("unknown");
-                match &error {
-                    Some(e) => log::warn!("Watch ended for '{}': {e}", label),
-                    None => log::info!("Watch stream ended for '{}'", label),
-                }
+            BgResult::WatchEnded { account_idx, watch_generation, error } => {
                 if let Some(acct) = self.accounts.get_mut(account_idx) {
+                    // Stale watcher — a newer watcher has been spawned since this one started.
+                    if watch_generation != acct.watch_generation {
+                        log::debug!(
+                            "Ignoring stale WatchEnded for '{}' (gen {} != current {})",
+                            acct.config.label,
+                            watch_generation,
+                            acct.watch_generation,
+                        );
+                        return;
+                    }
+                    match &error {
+                        Some(e) => log::warn!("Watch ended for '{}': {e}", acct.config.label),
+                        None => log::info!("Watch stream ended for '{}'", acct.config.label),
+                    }
                     let msg = error.unwrap_or_else(|| "Connection lost".into());
                     acct.last_error = Some(msg);
                     acct.session = None;
@@ -1069,6 +1200,15 @@ impl App {
                 match result {
                     Ok(session) => {
                         if let Some(acct) = self.accounts.get_mut(account_idx) {
+                            // If already connected (a prior reconnect won the race), drop
+                            // this duplicate session silently.
+                            if acct.session.is_some() {
+                                log::debug!(
+                                    "Ignoring duplicate reconnect for '{}' (already connected)",
+                                    acct.config.label,
+                                );
+                                return;
+                            }
                             log::info!(
                                 "Reconnected '{}' after {} attempt(s)",
                                 acct.config.label,
