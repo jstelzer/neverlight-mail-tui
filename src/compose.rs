@@ -18,9 +18,7 @@ pub enum ComposeField {
     Body,
 }
 
-#[allow(dead_code)]
 pub struct ComposeState {
-    pub mode: ComposeMode,
     pub to: String,
     pub subject: String,
     pub body: TextArea<'static>,
@@ -30,11 +28,10 @@ pub struct ComposeState {
 }
 
 impl ComposeState {
-    pub fn new(mode: ComposeMode) -> Self {
+    pub fn new(_mode: ComposeMode) -> Self {
         let mut body = TextArea::default();
         body.set_cursor_line_style(ratatui::style::Style::default());
         Self {
-            mode,
             to: String::new(),
             subject: String::new(),
             body,
