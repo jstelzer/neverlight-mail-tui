@@ -3,7 +3,6 @@ use super::{App, BgResult, Lane, Phase};
 impl App {
     pub(super) fn spawn_search(&mut self) {
         let query = self.search_query.clone();
-        let account_idx = self.active_account;
         let lane_epoch = self.start_lane(Lane::Search);
         self.phase = Phase::Searching;
         let cache = self.cache.clone();
@@ -11,7 +10,6 @@ impl App {
         let handle = tokio::spawn(async move {
             let result = cache.search(query).await;
             let _ = tx.send(BgResult::SearchResults {
-                account_idx,
                 lane_epoch,
                 result,
             });

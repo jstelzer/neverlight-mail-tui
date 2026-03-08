@@ -14,7 +14,7 @@ use futures::StreamExt;
 use ratatui::prelude::*;
 use ratatui_image::picker::{Picker, ProtocolType};
 
-use neverlight_mail_core::config::Config;
+use neverlight_mail_core::config;
 
 use app::{App, AppEvent};
 
@@ -51,7 +51,7 @@ fn detect_picker() -> Picker {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let accounts = match Config::resolve_all_accounts() {
+    let accounts = match config::resolve_all_accounts() {
         Ok(accounts) if !accounts.is_empty() => accounts,
         Ok(_) => return Err(anyhow::anyhow!("No accounts configured")),
         Err(needs_input) => {
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 setup::SetupResult::Cancelled => return Ok(()),
                 setup::SetupResult::Configured => {}
             }
-            Config::resolve_all_accounts()
+            config::resolve_all_accounts()
                 .map_err(|e| anyhow::anyhow!("Config error after setup: {e:?}"))?
         }
     };
@@ -119,7 +119,7 @@ async fn run(
                     _ => {}
                 }
             }
-            // Background task results — IMAP fetches land here
+            // Background task results — JMAP fetches land here
             Some(result) = app.bg_rx.recv() => {
                 app.apply(result);
             }

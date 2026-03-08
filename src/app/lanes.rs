@@ -132,11 +132,7 @@ impl App {
         epoch
     }
 
-    pub(super) fn register_lane_task(
-        &mut self,
-        lane: Lane,
-        handle: tokio::task::JoinHandle<()>,
-    ) {
+    pub(super) fn register_lane_task(&mut self, lane: Lane, handle: tokio::task::JoinHandle<()>) {
         match lane {
             Lane::Folder => self.lane_tasks.folder.push(handle),
             Lane::Message => self.lane_tasks.message = Some(handle),
@@ -146,10 +142,71 @@ impl App {
         }
     }
 
-    pub(super) fn current_selected_envelope_hash(&self) -> Option<u64> {
-        self.messages
-            .get(self.selected_message)
-            .map(|m| m.envelope_hash)
+    pub(super) fn account_lane_epoch(&self, account_id: &str, lane: Lane) -> u64 {
+        match lane {
+            Lane::Flag => *self.account_lane_epochs.flag.get(account_id).unwrap_or(&0),
+            Lane::Mutation => *self
+                .account_lane_epochs
+                .mutation
+                .get(account_id)
+                .unwrap_or(&0),
+            _ => self.lane_epoch(lane),
+        }
+    }
+
+    pub(super) fn start_account_lane(&mut self, account_id: &str, lane: Lane) -> u64 {
+        match lane {
+            Lane::Flag => {
+                if let Some(handle) = self.account_lane_tasks.flag.remove(account_id) {
+                    handle.abort();
+                }
+                self.diagnostics.next_op_id = self.diagnostics.next_op_id.saturating_add(1);
+                self.set_current_op_id(Lane::Flag, self.diagnostics.next_op_id);
+                let slot = self
+                    .account_lane_epochs
+                    .flag
+                    .entry(account_id.to_string())
+                    .or_insert(0);
+                *slot = slot.saturating_add(1);
+                *slot
+            }
+            Lane::Mutation => {
+                if let Some(handle) = self.account_lane_tasks.mutation.remove(account_id) {
+                    handle.abort();
+                }
+                self.diagnostics.next_op_id = self.diagnostics.next_op_id.saturating_add(1);
+                self.set_current_op_id(Lane::Mutation, self.diagnostics.next_op_id);
+                let slot = self
+                    .account_lane_epochs
+                    .mutation
+                    .entry(account_id.to_string())
+                    .or_insert(0);
+                *slot = slot.saturating_add(1);
+                *slot
+            }
+            _ => self.start_lane(lane),
+        }
+    }
+
+    pub(super) fn register_account_lane_task(
+        &mut self,
+        account_id: &str,
+        lane: Lane,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        match lane {
+            Lane::Flag => {
+                self.account_lane_tasks
+                    .flag
+                    .insert(account_id.to_string(), handle);
+            }
+            Lane::Mutation => {
+                self.account_lane_tasks
+                    .mutation
+                    .insert(account_id.to_string(), handle);
+            }
+            _ => self.register_lane_task(lane, handle),
+        }
     }
 
     pub(super) fn revalidate_selection(&mut self) {

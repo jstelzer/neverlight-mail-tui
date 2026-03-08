@@ -1,11 +1,9 @@
-use neverlight_mail_core::MailboxHash;
-
 use super::{App, BgResult, Lane, Phase};
 
 impl App {
     pub(super) fn spawn_load_folders(&mut self) {
-        let session = match self.active_session() {
-            Some(s) => s,
+        let client = match self.active_client() {
+            Some(c) => c,
             None => return,
         };
         let account_idx = self.active_account;
@@ -15,7 +13,9 @@ impl App {
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
         let handle = tokio::spawn(async move {
-            let result = session.fetch_folders().await.map_err(|e| e.to_string());
+            let result = neverlight_mail_core::mailbox::fetch_all(&client)
+                .await
+                .map_err(|e| e.to_string());
             if let Ok(ref folders) = result {
                 let _ = cache.save_folders(account_id, folders.clone()).await;
             }
@@ -34,8 +34,7 @@ impl App {
             return;
         }
         let folder = &acct.folders[self.selected_folder];
-        let mbox_hash_raw = folder.mailbox_hash;
-        let mbox_hash = MailboxHash(mbox_hash_raw);
+        let mailbox_id = folder.mailbox_id.clone();
         let folder_idx = self.selected_folder;
         let folder_name = folder.name.clone();
         let account_idx = self.active_account;
@@ -55,8 +54,8 @@ impl App {
         self.messages.clear();
         self.body_text = None;
 
-        let session = match self.active_session() {
-            Some(s) => s,
+        let client = match self.active_client() {
+            Some(c) => c,
             None => return,
         };
         let cache = self.cache.clone();
@@ -66,113 +65,128 @@ impl App {
         // Try cache first (fast path)
         let cache2 = cache.clone();
         let account_id2 = account_id.clone();
+        let mailbox_id2 = mailbox_id.clone();
         let tx2 = tx.clone();
         let cache_handle = tokio::spawn(async move {
             let result = cache2
-                .load_messages(account_id2, mbox_hash_raw, 200, 0)
+                .load_messages(account_id2, mailbox_id2.clone(), 200, 0)
                 .await;
             let _ = tx2.send(BgResult::CachedMessages {
                 account_idx,
                 lane_epoch,
                 folder_idx,
-                mailbox_hash: mbox_hash_raw,
+                mailbox_id: mailbox_id2,
                 result,
             });
         });
         self.register_lane_task(Lane::Folder, cache_handle);
 
-        // IMAP fetch (authoritative, overwrites cache)
-        let imap_handle = tokio::spawn(async move {
-            let result = session
-                .fetch_messages(mbox_hash)
+        // JMAP fetch (authoritative, overwrites cache)
+        let jmap_mailbox_id = mailbox_id.clone();
+        let jmap_handle = tokio::spawn(async move {
+            let result = neverlight_mail_core::email::query_and_get(&client, &jmap_mailbox_id, 200, 0)
                 .await
+                .map(|(msgs, _query_result)| msgs)
                 .map_err(|e| e.to_string());
             if let Ok(ref msgs) = result {
                 let _ = cache
-                    .save_messages(account_id, mbox_hash_raw, msgs.clone())
+                    .save_messages(account_id, mailbox_id.clone(), msgs.clone())
                     .await;
             }
             let _ = tx.send(BgResult::Messages {
                 account_idx,
                 lane_epoch,
                 folder_idx,
-                mailbox_hash: mbox_hash_raw,
+                mailbox_id,
                 result,
             });
         });
-        self.register_lane_task(Lane::Folder, imap_handle);
+        self.register_lane_task(Lane::Folder, jmap_handle);
     }
 
     pub(super) fn spawn_load_body(&mut self) {
         if self.messages.is_empty() {
             return;
         }
-        let msg = &self.messages[self.selected_message];
-        let env_hash_raw = msg.envelope_hash;
-        let env_hash = neverlight_mail_core::EnvelopeHash(env_hash_raw);
-        let account_idx = self.active_account;
+        let msg = match self.messages.get(self.selected_message).cloned() {
+            Some(msg) => msg,
+            None => {
+                log::warn!("spawn_load_body: selected_message {} out of bounds", self.selected_message);
+                return;
+            }
+        };
+        let email_id = msg.email_id.clone();
+        let mailbox_id = msg.mailbox_id.clone();
+        let (account_idx, account_id) = match self.account_for_message(&msg) {
+            Some(account) => account,
+            None => {
+                log::warn!("spawn_load_body: no account for message {}", email_id);
+                return;
+            }
+        };
         let lane_epoch = self.start_lane(Lane::Message);
         self.phase = Phase::Loading;
         self.status = "Loading body…".into();
 
-        let session = match self.active_session() {
-            Some(s) => s,
-            None => return,
+        let client = match self.accounts[account_idx].client.clone() {
+            Some(c) => c,
+            None => {
+                log::warn!("spawn_load_body: no client for account {} (reconnecting?)", account_id);
+                self.status = "No connection — waiting for reconnect…".into();
+                return;
+            }
         };
         let cache = self.cache.clone();
-        let account_id = self.active_account_id();
         let tx = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
             // Try cache first
-            if let Ok(Some((md_body, plain_body, attachments))) =
-                cache.load_body(account_id.clone(), env_hash_raw).await
+            if let Ok(Some((_md_body, plain_body, attachments))) =
+                cache.load_body(account_id.clone(), email_id.clone()).await
             {
                 let body = if !plain_body.is_empty() {
                     plain_body
                 } else {
-                    md_body
+                    _md_body
                 };
                 let _ = tx.send(BgResult::Body {
-                    account_idx,
+                    account_id: account_id.clone(),
                     lane_epoch,
-                    envelope_hash: env_hash_raw,
+                    mailbox_id,
+                    email_id,
                     result: Ok((body, attachments)),
                 });
                 return;
             }
 
-            // Cache miss — fetch from IMAP
-            let result = session.fetch_body(env_hash).await;
+            // Cache miss — fetch from JMAP
+            let result = neverlight_mail_core::email::get_body(&client, &email_id).await;
             let rendered = result
-                .map(|(text_plain, text_html, attachments)| {
-                    let rendered = neverlight_mail_core::mime::render_body(
-                        if text_plain.is_empty() {
-                            None
-                        } else {
-                            Some(text_plain.as_str())
-                        },
-                        if text_html.is_empty() {
-                            None
-                        } else {
-                            Some(text_html.as_str())
-                        },
-                    );
+                .map(|(markdown_body, plain_body, attachments)| {
                     // Save to cache (fire-and-forget)
                     let cache2 = cache.clone();
                     let account_id2 = account_id.clone();
+                    let email_id2 = email_id.clone();
+                    let md_clone = markdown_body.clone();
+                    let plain_clone = plain_body.clone();
                     let att_clone = attachments.clone();
                     tokio::spawn(async move {
                         let _ = cache2
-                            .save_body(account_id2, env_hash_raw, text_plain, text_html, att_clone)
+                            .save_body(account_id2, email_id2, md_clone, plain_clone, att_clone)
                             .await;
                     });
-                    (rendered, attachments)
+                    let body = if !plain_body.is_empty() {
+                        plain_body
+                    } else {
+                        markdown_body
+                    };
+                    (body, attachments)
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(BgResult::Body {
-                account_idx,
+                account_id,
                 lane_epoch,
-                envelope_hash: env_hash_raw,
+                mailbox_id,
+                email_id,
                 result: rendered,
             });
         });

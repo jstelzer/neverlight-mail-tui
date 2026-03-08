@@ -7,12 +7,12 @@ use neverlight_mail_core::models::MessageSummary;
 /// Returns `(thread_sizes, visible_indices)`.
 pub fn compute_visible(
     messages: &[MessageSummary],
-    collapsed: &HashSet<u64>,
-) -> (HashMap<u64, usize>, Vec<usize>) {
-    let mut thread_sizes: HashMap<u64, usize> = HashMap::new();
+    collapsed: &HashSet<String>,
+) -> (HashMap<String, usize>, Vec<usize>) {
+    let mut thread_sizes: HashMap<String, usize> = HashMap::new();
     for msg in messages {
-        if let Some(tid) = msg.thread_id {
-            *thread_sizes.entry(tid).or_insert(0) += 1;
+        if let Some(ref tid) = msg.thread_id {
+            *thread_sizes.entry(tid.clone()).or_insert(0) += 1;
         }
     }
 
@@ -21,9 +21,9 @@ pub fn compute_visible(
         if msg.thread_depth == 0 {
             // Root or standalone — always visible
             visible.push(i);
-        } else if let Some(tid) = msg.thread_id {
+        } else if let Some(ref tid) = msg.thread_id {
             // Child — visible only if thread is not collapsed
-            if !collapsed.contains(&tid) {
+            if !collapsed.contains(tid) {
                 visible.push(i);
             }
         } else {
@@ -67,9 +67,10 @@ pub fn visible_nav(
 mod tests {
     use super::*;
 
-    fn msg(thread_id: Option<u64>, depth: u32) -> MessageSummary {
+    fn msg(thread_id: Option<&str>, depth: u32) -> MessageSummary {
         MessageSummary {
-            uid: 0,
+            account_id: String::new(),
+            email_id: String::new(),
             subject: String::new(),
             from: String::new(),
             to: String::new(),
@@ -77,10 +78,9 @@ mod tests {
             is_read: false,
             is_starred: false,
             has_attachments: false,
-            thread_id,
-            envelope_hash: 0,
+            thread_id: thread_id.map(|s| s.to_string()),
+            mailbox_id: String::new(),
             timestamp: 0,
-            mailbox_hash: 0,
             message_id: String::new(),
             in_reply_to: None,
             reply_to: None,
@@ -102,17 +102,17 @@ mod tests {
 
     #[test]
     fn thread_expanded_shows_all() {
-        // Root + 2 children in thread 42
-        let messages = vec![msg(Some(42), 0), msg(Some(42), 1), msg(Some(42), 1)];
+        // Root + 2 children in thread "T42"
+        let messages = vec![msg(Some("T42"), 0), msg(Some("T42"), 1), msg(Some("T42"), 1)];
         let (sizes, visible) = compute_visible(&messages, &HashSet::new());
         assert_eq!(visible, vec![0, 1, 2]);
-        assert_eq!(sizes[&42], 3);
+        assert_eq!(sizes["T42"], 3);
     }
 
     #[test]
     fn thread_collapsed_hides_children() {
-        let messages = vec![msg(Some(42), 0), msg(Some(42), 1), msg(Some(42), 1)];
-        let collapsed = HashSet::from([42]);
+        let messages = vec![msg(Some("T42"), 0), msg(Some("T42"), 1), msg(Some("T42"), 1)];
+        let collapsed = HashSet::from(["T42".to_string()]);
         let (_sizes, visible) = compute_visible(&messages, &collapsed);
         // Only root is visible
         assert_eq!(visible, vec![0]);
@@ -121,18 +121,18 @@ mod tests {
     #[test]
     fn mixed_threads_and_standalone() {
         let messages = vec![
-            msg(Some(1), 0), // 0: thread 1 root
-            msg(Some(1), 1), // 1: thread 1 child
-            msg(None, 0),    // 2: standalone
-            msg(Some(2), 0), // 3: thread 2 root
-            msg(Some(2), 1), // 4: thread 2 child
+            msg(Some("T1"), 0), // 0: thread T1 root
+            msg(Some("T1"), 1), // 1: thread T1 child
+            msg(None, 0),       // 2: standalone
+            msg(Some("T2"), 0), // 3: thread T2 root
+            msg(Some("T2"), 1), // 4: thread T2 child
         ];
-        // Collapse thread 1 only
-        let collapsed = HashSet::from([1]);
+        // Collapse thread T1 only
+        let collapsed = HashSet::from(["T1".to_string()]);
         let (sizes, visible) = compute_visible(&messages, &collapsed);
         assert_eq!(visible, vec![0, 2, 3, 4]);
-        assert_eq!(sizes[&1], 2);
-        assert_eq!(sizes[&2], 2);
+        assert_eq!(sizes["T1"], 2);
+        assert_eq!(sizes["T2"], 2);
     }
 
     #[test]
@@ -173,8 +173,6 @@ mod tests {
 
     #[test]
     fn nav_with_threading_skips_collapsed() {
-        // visible_indices maps visible rows to message indices
-        // e.g. thread collapsed: [0, 3, 4] means messages 1,2 are hidden
         let vis = vec![0, 3, 4];
         assert_eq!(visible_nav(&vis, 5, 0, 1), Some(3));
         assert_eq!(visible_nav(&vis, 5, 3, 1), Some(4));
@@ -191,9 +189,7 @@ mod tests {
 
     #[test]
     fn nav_selected_not_in_visible_falls_back_to_zero() {
-        // selected_message=2 isn't in visible_indices — unwrap_or(0) kicks in
         let vis = vec![0, 3, 4];
-        // From position 0 (fallback), move down → position 1 → index 3
         assert_eq!(visible_nav(&vis, 5, 2, 1), Some(3));
     }
 }

@@ -17,8 +17,8 @@ impl App {
             return;
         }
         let msg = &self.messages[self.selected_message];
-        let tid = match msg.thread_id {
-            Some(t) => t,
+        let tid = match &msg.thread_id {
+            Some(t) => t.clone(),
             None => return,
         };
         let size = self.thread_sizes.get(&tid).copied().unwrap_or(1);
@@ -28,13 +28,13 @@ impl App {
         if self.collapsed_threads.contains(&tid) {
             self.collapsed_threads.remove(&tid);
         } else {
-            self.collapsed_threads.insert(tid);
+            self.collapsed_threads.insert(tid.clone());
             // If selected was a child, jump to thread root
             if msg.thread_depth > 0 {
                 if let Some(root_idx) = self
                     .messages
                     .iter()
-                    .position(|m| m.thread_id == Some(tid) && m.thread_depth == 0)
+                    .position(|m| m.thread_id.as_deref() == Some(&tid) && m.thread_depth == 0)
                 {
                     self.selected_message = root_idx;
                 }
@@ -128,8 +128,8 @@ impl App {
             KeyCode::Enter => self.select(),
             KeyCode::Char('s') => self.toggle_star(),
             KeyCode::Char('R') => self.toggle_read(),
-            KeyCode::Char('d') => self.move_to_folder("Trash"),
-            KeyCode::Char('a') => self.move_to_folder("Archive"),
+            KeyCode::Char('d') => self.move_to_folder("trash"),
+            KeyCode::Char('a') => self.move_to_folder("archive"),
             KeyCode::Char('/') => {
                 self.search_active = true;
                 self.search_query.clear();
@@ -208,8 +208,9 @@ impl App {
         }
 
         let lr = &self.layout_rects;
-        let in_rect =
-            |r: &ratatui::prelude::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+        let in_rect = |r: &ratatui::prelude::Rect| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        };
 
         match kind {
             MouseEventKind::Down(_) => {

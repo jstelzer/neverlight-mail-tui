@@ -8,21 +8,21 @@ mod sync;
 mod watch;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::prelude::Rect;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use neverlight_mail_core::client::JmapClient;
 use neverlight_mail_core::config::AccountConfig;
-use neverlight_mail_core::imap::ImapSession;
 use neverlight_mail_core::models::{AttachmentData, Folder, MessageSummary};
+use neverlight_mail_core::session::JmapSession;
 use neverlight_mail_core::store::CacheHandle;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::thread::{ResizeRequest, ThreadProtocol};
 
-use crate::compose::{ComposeState};
+use crate::compose::ComposeState;
 
 // ---------------------------------------------------------------------------
 // Error classification helpers
@@ -33,6 +33,8 @@ fn error_indicates_dead_session(e: &str) -> bool {
     lower.contains("broken pipe")
         || lower.contains("connection reset")
         || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline has elapsed")
         || lower.contains("not connected")
         || lower.contains("connection refused")
         || lower.contains("eof")
@@ -49,7 +51,6 @@ fn body_error_indicates_stale_message(e: &str) -> bool {
 // Background task results
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub enum BgResult {
     Folders {
         account_idx: usize,
@@ -60,28 +61,29 @@ pub enum BgResult {
         account_idx: usize,
         lane_epoch: u64,
         folder_idx: usize,
-        mailbox_hash: u64,
+        mailbox_id: String,
         result: Result<Vec<MessageSummary>, String>,
     },
-    /// Cached messages arrived (show immediately, IMAP fetch may follow)
+    /// Cached messages arrived (show immediately, JMAP fetch may follow)
     CachedMessages {
         account_idx: usize,
         lane_epoch: u64,
         folder_idx: usize,
-        mailbox_hash: u64,
+        mailbox_id: String,
         result: Result<Vec<MessageSummary>, String>,
     },
     Body {
-        account_idx: usize,
+        account_id: String,
         lane_epoch: u64,
-        envelope_hash: u64,
+        mailbox_id: String,
+        email_id: String,
         result: Result<(String, Vec<AttachmentData>), String>,
     },
     /// Flag operation completed (or failed — revert optimistic update)
     FlagOp {
-        account_idx: usize,
+        account_id: String,
         lane_epoch: u64,
-        envelope_hash: u64,
+        email_id: String,
         /// Original flags to restore on failure
         was_read: bool,
         was_starred: bool,
@@ -89,49 +91,38 @@ pub enum BgResult {
     },
     /// Move operation completed (or failed — revert optimistic removal)
     MoveOp {
-        account_idx: usize,
+        account_id: String,
         lane_epoch: u64,
-        envelope_hash: u64,
-        source_mailbox_hash: u64,
         destination_name: String,
-        reconciled_source_toc: Option<Vec<MessageSummary>>,
-        retryable: bool,
-        postcondition_failed: bool,
         /// Original message + index for reinsertion on failure
         message: Box<Option<(usize, MessageSummary)>>,
         result: Result<(), String>,
     },
     SearchResults {
-        account_idx: usize,
         lane_epoch: u64,
         result: Result<Vec<MessageSummary>, String>,
     },
     SendResult(Result<(), String>),
-    /// IDLE event: server notified of new/changed/removed messages
-    ImapEvent {
+    /// Push state changed — trigger refresh
+    PushStateChanged {
         account_idx: usize,
         watch_generation: u64,
-        mailbox_hash: u64,
-        kind: ImapEventKind,
     },
-    /// Watch stream ended or errored
-    WatchEnded {
+    /// Push stream ended or errored
+    PushEnded {
         account_idx: usize,
         watch_generation: u64,
         error: Option<String>,
     },
+    /// Re-spawn push watcher after a delay
+    PushRetry {
+        account_idx: usize,
+    },
     /// Reconnect attempt completed
     Reconnected {
         account_idx: usize,
-        result: Result<Arc<ImapSession>, String>,
+        result: Result<JmapClient, String>,
     },
-}
-
-#[derive(Debug)]
-pub enum ImapEventKind {
-    NewMail,
-    Remove(u64),
-    Rescan,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,9 +131,8 @@ pub enum ImapEventKind {
 
 pub struct AccountState {
     pub config: AccountConfig,
-    pub session: Option<Arc<ImapSession>>,
+    pub client: Option<JmapClient>,
     pub folders: Vec<Folder>,
-    pub folder_map: HashMap<String, u64>,
     /// Consecutive reconnect failures (reset on success).
     pub reconnect_attempts: u32,
     /// Last error message for diagnostics.
@@ -161,14 +151,6 @@ impl AccountState {
             _ => 60,
         };
         Duration::from_secs(secs)
-    }
-
-    fn rebuild_folder_map(&mut self) {
-        self.folder_map = self
-            .folders
-            .iter()
-            .map(|f| (f.path.clone(), f.mailbox_hash))
-            .collect();
     }
 }
 
@@ -192,11 +174,11 @@ pub struct App {
     pub search_query: String,
     pub compose: Option<ComposeState>,
     /// Thread IDs that are collapsed (children hidden)
-    pub collapsed_threads: HashSet<u64>,
+    pub collapsed_threads: HashSet<String>,
     /// Maps visible row index → actual index in self.messages
     pub visible_indices: Vec<usize>,
     /// Number of messages per thread_id
-    pub thread_sizes: HashMap<u64, usize>,
+    pub thread_sizes: HashMap<String, usize>,
     pub bg_rx: mpsc::UnboundedReceiver<BgResult>,
     pub(super) bg_tx: mpsc::UnboundedSender<BgResult>,
     /// Layout rects set by ui::render each frame, used for mouse hit-testing.
@@ -216,6 +198,10 @@ pub struct App {
     pub attachment_info: Vec<(String, String, usize)>,
     pub(super) lane_epochs: LaneEpochs,
     pub(super) lane_tasks: LaneTasks,
+    pub(super) account_lane_epochs: AccountLaneEpochs,
+    pub(super) account_lane_tasks: AccountLaneTasks,
+    /// At most one delayed reconnect task per account.
+    pub(super) reconnect_tasks: HashMap<usize, JoinHandle<()>>,
     pub diagnostics: Diagnostics,
 }
 
@@ -275,6 +261,18 @@ pub(super) struct LaneTasks {
     pub mutation: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+pub(super) struct AccountLaneEpochs {
+    pub flag: HashMap<String, u64>,
+    pub mutation: HashMap<String, u64>,
+}
+
+#[derive(Default)]
+pub(super) struct AccountLaneTasks {
+    pub flag: HashMap<String, JoinHandle<()>>,
+    pub mutation: HashMap<String, JoinHandle<()>>,
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct LaneOpIds {
     pub folder: u64,
@@ -288,7 +286,6 @@ pub struct LaneOpIds {
 pub struct Diagnostics {
     pub current_op_ids: LaneOpIds,
     pub toc_drift_count: u64,
-    pub postcondition_failure_count: u64,
     pub refresh_stuck_count: u64,
     pub refresh_timeout_count: u64,
     pub(super) next_op_id: u64,
@@ -307,12 +304,50 @@ impl App {
         &self.accounts[self.active_account]
     }
 
-    pub(super) fn active_session(&self) -> Option<Arc<ImapSession>> {
-        self.active().session.clone()
+    pub(super) fn active_client(&self) -> Option<JmapClient> {
+        self.active().client.clone()
     }
 
     pub(super) fn active_account_id(&self) -> String {
         self.active().config.id.clone()
+    }
+
+    pub(super) fn account_idx_by_id(&self, account_id: &str) -> Option<usize> {
+        self.accounts
+            .iter()
+            .position(|acct| acct.config.id == account_id)
+    }
+
+    pub(super) fn account_for_message(&self, msg: &MessageSummary) -> Option<(usize, String)> {
+        if !msg.account_id.is_empty() {
+            let account_id = msg.account_id.clone();
+            self.account_idx_by_id(&account_id)
+                .map(|idx| (idx, account_id))
+        } else {
+            Some((self.active_account, self.active_account_id()))
+        }
+    }
+
+    pub(super) fn fill_missing_account_ids(
+        &self,
+        messages: &mut [MessageSummary],
+        fallback_account_id: &str,
+    ) {
+        for msg in messages {
+            if msg.account_id.is_empty() {
+                msg.account_id = fallback_account_id.to_string();
+            }
+        }
+    }
+
+    pub(super) fn message_identity(msg: &MessageSummary) -> (&str, &str, &str) {
+        (&msg.account_id, &msg.mailbox_id, &msg.email_id)
+    }
+
+    pub(super) fn selected_message_identity(&self) -> Option<(&str, &str, &str)> {
+        self.messages
+            .get(self.selected_message)
+            .map(Self::message_identity)
     }
 
     pub fn active_folders(&self) -> &[Folder] {
@@ -324,13 +359,11 @@ impl App {
 
         let mut account_states = Vec::new();
         for config in accounts {
-            let imap_config = config.to_imap_config();
-            let session = ImapSession::connect(imap_config).await.ok();
+            let client = JmapSession::connect(&config).await.ok().map(|(_, c)| c);
             let state = AccountState {
                 config,
-                session,
+                client,
                 folders: Vec::new(),
-                folder_map: HashMap::new(),
                 reconnect_attempts: 0,
                 last_error: None,
                 watch_generation: 0,
@@ -371,6 +404,9 @@ impl App {
             attachment_info: Vec::new(),
             lane_epochs: LaneEpochs::default(),
             lane_tasks: LaneTasks::default(),
+            account_lane_epochs: AccountLaneEpochs::default(),
+            account_lane_tasks: AccountLaneTasks::default(),
+            reconnect_tasks: HashMap::new(),
             diagnostics: Diagnostics::default(),
         };
 
@@ -408,7 +444,6 @@ impl App {
                         self.phase = Phase::Idle;
                         let acct = &mut self.accounts[account_idx];
                         acct.folders = folders;
-                        acct.rebuild_folder_map();
                         if !acct.folders.is_empty() {
                             self.spawn_load_messages();
                         }
@@ -416,10 +451,13 @@ impl App {
                     Err(e) => {
                         self.phase = Phase::Error;
                         self.status = format!("Folder error: {e}");
-                        log::error!("Folder sync failed for '{}': {e} — dropping session", self.accounts[account_idx].config.label);
+                        log::error!(
+                            "Folder sync failed for '{}': {e} — dropping client",
+                            self.accounts[account_idx].config.label
+                        );
                         let acct = &mut self.accounts[account_idx];
                         acct.last_error = Some(e);
-                        acct.session = None;
+                        acct.client = None;
                         acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
                         self.spawn_reconnect(account_idx);
                     }
@@ -429,7 +467,7 @@ impl App {
                 account_idx,
                 lane_epoch,
                 folder_idx,
-                mailbox_hash,
+                mailbox_id,
                 result,
             } => {
                 if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Folder)
@@ -447,8 +485,8 @@ impl App {
                     .active()
                     .folders
                     .get(folder_idx)
-                    .map(|f| f.mailbox_hash)
-                    != Some(mailbox_hash)
+                    .map(|f| f.mailbox_id.as_str())
+                    != Some(mailbox_id.as_str())
                 {
                     self.diagnostics.toc_drift_count =
                         self.diagnostics.toc_drift_count.saturating_add(1);
@@ -456,15 +494,15 @@ impl App {
                 }
                 match result {
                     Ok(mut msgs) => {
+                        let account_id = self.accounts[account_idx].config.id.clone();
+                        self.fill_missing_account_ids(&mut msgs, &account_id);
                         msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                         let name = &self.active().folders[folder_idx].name;
                         self.status = format!("{name} — {} messages", msgs.len());
                         self.phase = Phase::Idle;
                         // Reconcile sidebar unread count from actual message flags
                         let unread = msgs.iter().filter(|m| !m.is_read).count() as u32;
-                        if let Some(folder) = self.accounts[account_idx]
-                            .folders
-                            .get_mut(folder_idx)
+                        if let Some(folder) = self.accounts[account_idx].folders.get_mut(folder_idx)
                         {
                             if folder.unread_count != unread {
                                 log::debug!(
@@ -481,14 +519,21 @@ impl App {
                         self.body_text = None;
                         self.collapsed_threads.clear();
                         self.recompute_visible();
+                        // Auto-focus message list when messages arrive
+                        if !self.messages.is_empty() {
+                            self.focus = Focus::Messages;
+                        }
                     }
                     Err(e) => {
                         self.phase = Phase::Error;
                         self.status = format!("Fetch error: {e}");
-                        log::error!("Message sync failed for '{}': {e} — dropping session", self.accounts[account_idx].config.label);
+                        log::error!(
+                            "Message sync failed for '{}': {e} — dropping client",
+                            self.accounts[account_idx].config.label
+                        );
                         let acct = &mut self.accounts[account_idx];
                         acct.last_error = Some(e);
-                        acct.session = None;
+                        acct.client = None;
                         acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
                         self.spawn_reconnect(account_idx);
                     }
@@ -498,7 +543,7 @@ impl App {
                 account_idx,
                 lane_epoch,
                 folder_idx,
-                mailbox_hash,
+                mailbox_id,
                 result,
             } => {
                 if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Folder)
@@ -516,8 +561,8 @@ impl App {
                     .active()
                     .folders
                     .get(folder_idx)
-                    .map(|f| f.mailbox_hash)
-                    != Some(mailbox_hash)
+                    .map(|f| f.mailbox_id.as_str())
+                    != Some(mailbox_id.as_str())
                 {
                     self.diagnostics.toc_drift_count =
                         self.diagnostics.toc_drift_count.saturating_add(1);
@@ -528,6 +573,8 @@ impl App {
                 }
                 if let Ok(mut msgs) = result {
                     if !msgs.is_empty() {
+                        let account_id = self.accounts[account_idx].config.id.clone();
+                        self.fill_missing_account_ids(&mut msgs, &account_id);
                         msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                         let name = &self.active().folders[folder_idx].name;
                         self.status = format!("{name} — {} cached, syncing…", msgs.len());
@@ -535,18 +582,20 @@ impl App {
                         self.selected_message = 0;
                         self.body_text = None;
                         self.recompute_visible();
+                        self.focus = Focus::Messages;
                     }
                 }
             }
             BgResult::Body {
-                account_idx,
+                account_id,
                 lane_epoch,
-                envelope_hash,
+                mailbox_id,
+                email_id,
                 result,
             } => {
-                if account_idx != self.active_account
-                    || lane_epoch != self.lane_epoch(Lane::Message)
-                    || self.current_selected_envelope_hash() != Some(envelope_hash)
+                if lane_epoch != self.lane_epoch(Lane::Message)
+                    || self.selected_message_identity()
+                        != Some((account_id.as_str(), mailbox_id.as_str(), email_id.as_str()))
                 {
                     self.diagnostics.toc_drift_count =
                         self.diagnostics.toc_drift_count.saturating_add(1);
@@ -579,7 +628,7 @@ impl App {
                         if let Some(msg) = self
                             .messages
                             .iter()
-                            .find(|m| m.envelope_hash == envelope_hash)
+                            .find(|m| m.email_id == email_id)
                         {
                             self.status = msg.subject.clone();
                         }
@@ -590,13 +639,12 @@ impl App {
                         if body_error_indicates_stale_message(&e) {
                             log::warn!(
                                 "Evicting stale message {} (body error: {e})",
-                                envelope_hash,
+                                email_id,
                             );
-                            if let Some(pos) = self
-                                .messages
-                                .iter()
-                                .position(|m| m.envelope_hash == envelope_hash)
-                            {
+                            if let Some(pos) = self.messages.iter().position(|m| {
+                                Self::message_identity(m)
+                                    == (account_id.as_str(), mailbox_id.as_str(), email_id.as_str())
+                            }) {
                                 self.messages.remove(pos);
                                 if self.selected_message >= self.messages.len()
                                     && !self.messages.is_empty()
@@ -607,22 +655,20 @@ impl App {
                             }
                             // Evict from cache
                             let cache = self.cache.clone();
-                            let account_id = self.active_account_id();
+                            let evict_account_id = account_id.clone();
+                            let evict_email_id = email_id.clone();
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    cache.remove_message(account_id, envelope_hash).await
+                                    cache.remove_message(evict_account_id, evict_email_id).await
                                 {
-                                    log::warn!(
-                                        "Failed to evict stale message from cache: {e}"
-                                    );
+                                    log::warn!("Failed to evict stale message from cache: {e}");
                                 }
                             });
                             self.body_text = None;
                             self.attachment_info.clear();
                             self.image_protos.clear();
                             self.image_index = 0;
-                            self.status =
-                                "Message no longer exists on server".into();
+                            self.status = "Message no longer exists on server".into();
                             self.spawn_load_messages();
                             return;
                         }
@@ -632,53 +678,53 @@ impl App {
                         self.image_protos.clear();
                         self.image_index = 0;
                         self.status = format!("Body error: {e}");
+                        if let Some(account_idx) = self.account_idx_by_id(&account_id) {
+                            if self.accounts[account_idx].client.is_none()
+                                || error_indicates_dead_session(&e)
+                            {
+                                self.drop_client_and_reconnect(account_idx, "body-failed");
+                            }
+                        }
                     }
                 }
             }
             BgResult::FlagOp {
-                account_idx,
+                account_id,
                 lane_epoch,
-                envelope_hash,
+                email_id,
                 was_read,
                 was_starred,
                 result,
             } => {
-                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Flag) {
+                if lane_epoch != self.account_lane_epoch(&account_id, Lane::Flag) {
                     return;
                 }
                 if let Err(e) = result {
                     self.phase = Phase::Error;
-                    if let Some(msg) = self
-                        .messages
-                        .iter_mut()
-                        .find(|m| m.envelope_hash == envelope_hash)
-                    {
+                    if let Some(msg) = self.messages.iter_mut().find(|m| {
+                        m.account_id == account_id && m.email_id == email_id
+                    }) {
                         msg.is_read = was_read;
                         msg.is_starred = was_starred;
                     }
                     self.status = format!("Flag error: {e}");
-                    if self.accounts[account_idx].session.is_none()
-                        || error_indicates_dead_session(&e)
-                    {
-                        self.drop_session_and_reconnect(account_idx, "flag-failed");
+                    if let Some(account_idx) = self.account_idx_by_id(&account_id) {
+                        if self.accounts[account_idx].client.is_none()
+                            || error_indicates_dead_session(&e)
+                        {
+                            self.drop_client_and_reconnect(account_idx, "flag-failed");
+                        }
                     }
                 }
             }
             BgResult::MoveOp {
-                account_idx,
+                account_id,
                 lane_epoch,
-                envelope_hash: _,
-                source_mailbox_hash,
                 destination_name,
-                reconciled_source_toc,
-                retryable,
-                postcondition_failed,
                 message,
                 result,
             } => {
-                if account_idx != self.active_account
-                    || lane_epoch != self.lane_epoch(Lane::Mutation)
-                {
+                if lane_epoch != self.account_lane_epoch(&account_id, Lane::Mutation) {
                     return;
                 }
                 match result {
@@ -688,50 +734,27 @@ impl App {
                     }
                     Err(e) => {
                         self.phase = Phase::Error;
-                        if let Some(mut msgs) = reconciled_source_toc {
-                            let selected_mailbox_hash = self
-                                .active()
-                                .folders
-                                .get(self.selected_folder)
-                                .map(|f| f.mailbox_hash);
-                            if selected_mailbox_hash == Some(source_mailbox_hash) {
-                                msgs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-                                self.messages = msgs;
-                                self.selected_message = 0;
-                                self.body_text = None;
-                                self.collapsed_threads.clear();
-                            }
-                        } else if let Some((idx, msg)) = *message {
+                        // Re-insert the message on failure
+                        if let Some((idx, msg)) = *message {
                             let insert_at = idx.min(self.messages.len());
                             self.messages.insert(insert_at, msg);
                         }
-
-                        if postcondition_failed {
-                            self.diagnostics.postcondition_failure_count = self
-                                .diagnostics
-                                .postcondition_failure_count
-                                .saturating_add(1);
-                        }
-                        if retryable {
-                            self.status = format!("Move error (retryable): {e}");
-                        } else {
-                            self.status = format!("Move error: {e}");
-                        }
-                        if self.accounts[account_idx].session.is_none()
-                            || error_indicates_dead_session(&e)
-                        {
-                            self.drop_session_and_reconnect(account_idx, "move-failed");
+                        self.status = format!("Move error: {e}");
+                        if let Some(account_idx) = self.account_idx_by_id(&account_id) {
+                            if self.accounts[account_idx].client.is_none()
+                                || error_indicates_dead_session(&e)
+                            {
+                                self.drop_client_and_reconnect(account_idx, "move-failed");
+                            }
                         }
                     }
                 }
             }
             BgResult::SearchResults {
-                account_idx,
                 lane_epoch,
                 result,
             } => {
-                if account_idx != self.active_account || lane_epoch != self.lane_epoch(Lane::Search)
-                {
+                if lane_epoch != self.lane_epoch(Lane::Search) {
                     return;
                 }
                 match result {
@@ -762,17 +785,15 @@ impl App {
                     self.status = format!("Send error: {e}");
                 }
             },
-            BgResult::ImapEvent {
+            BgResult::PushStateChanged {
                 account_idx,
                 watch_generation,
-                mailbox_hash,
-                kind,
             } => {
-                // Stale watcher — ignore events from a superseded watch stream.
+                // Stale watcher — ignore events from a superseded push stream.
                 if let Some(acct) = self.accounts.get(account_idx) {
                     if watch_generation != acct.watch_generation {
                         log::debug!(
-                            "Ignoring stale ImapEvent for '{}' (gen {} != current {})",
+                            "Ignoring stale PushStateChanged for '{}' (gen {} != current {})",
                             acct.config.label,
                             watch_generation,
                             acct.watch_generation,
@@ -780,40 +801,25 @@ impl App {
                         return;
                     }
                 }
-                // Only act if event is for the active account and current folder
+                // Refresh the active account's current folder
                 let is_active = account_idx == self.active_account;
-                let current_mbox = self
-                    .active()
-                    .folders
-                    .get(self.selected_folder)
-                    .map(|f| f.mailbox_hash);
-                match kind {
-                    ImapEventKind::NewMail | ImapEventKind::Rescan => {
-                        if is_active && current_mbox == Some(mailbox_hash) {
-                            self.phase = Phase::Refreshing;
-                            self.begin_refresh_watchdog();
-                            self.status = "New mail — refreshing…".into();
-                            self.spawn_load_messages();
-                        }
-                    }
-                    ImapEventKind::Remove(envelope_hash) => {
-                        if is_active && current_mbox == Some(mailbox_hash) {
-                            self.messages.retain(|m| m.envelope_hash != envelope_hash);
-                            if self.selected_message >= self.messages.len()
-                                && !self.messages.is_empty()
-                            {
-                                self.selected_message = self.messages.len() - 1;
-                            }
-                        }
-                    }
+                if is_active {
+                    self.phase = Phase::Refreshing;
+                    self.begin_refresh_watchdog();
+                    self.status = "State changed — refreshing…".into();
+                    self.spawn_load_messages();
                 }
             }
-            BgResult::WatchEnded { account_idx, watch_generation, error } => {
+            BgResult::PushEnded {
+                account_idx,
+                watch_generation,
+                error,
+            } => {
                 if let Some(acct) = self.accounts.get_mut(account_idx) {
                     // Stale watcher — a newer watcher has been spawned since this one started.
                     if watch_generation != acct.watch_generation {
                         log::debug!(
-                            "Ignoring stale WatchEnded for '{}' (gen {} != current {})",
+                            "Ignoring stale PushEnded for '{}' (gen {} != current {})",
                             acct.config.label,
                             watch_generation,
                             acct.watch_generation,
@@ -821,23 +827,37 @@ impl App {
                         return;
                     }
                     match &error {
-                        Some(e) => log::warn!("Watch ended for '{}': {e}", acct.config.label),
-                        None => log::info!("Watch stream ended for '{}'", acct.config.label),
+                        Some(e) => log::warn!("Push ended for '{}': {e}", acct.config.label),
+                        None => log::info!("Push stream ended for '{}'", acct.config.label),
                     }
-                    let msg = error.unwrap_or_else(|| "Connection lost".into());
-                    acct.last_error = Some(msg);
-                    acct.session = None;
-                    acct.reconnect_attempts = acct.reconnect_attempts.saturating_add(1);
-                    self.spawn_reconnect(account_idx);
+                    acct.last_error = error.or_else(|| Some("Push stream ended".into()));
+                    // Don't null the API client — push failures don't mean the
+                    // API is dead. Just re-spawn the watcher after a delay.
+                    let account_idx_copy = account_idx;
+                    let tx = self.bg_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let _ = tx.send(BgResult::PushRetry { account_idx: account_idx_copy });
+                    });
                 }
             }
-            BgResult::Reconnected { account_idx, result } => {
+            BgResult::PushRetry { account_idx } => {
+                if self.accounts.get(account_idx).and_then(|a| a.client.as_ref()).is_some() {
+                    log::info!("Re-spawning push watcher for account {}", account_idx);
+                    self.spawn_watcher_for(account_idx);
+                }
+            }
+            BgResult::Reconnected {
+                account_idx,
+                result,
+            } => {
+                self.reconnect_tasks.remove(&account_idx);
                 match result {
-                    Ok(session) => {
+                    Ok(client) => {
                         if let Some(acct) = self.accounts.get_mut(account_idx) {
                             // If already connected (a prior reconnect won the race), drop
-                            // this duplicate session silently.
-                            if acct.session.is_some() {
+                            // this duplicate client silently.
+                            if acct.client.is_some() {
                                 log::debug!(
                                     "Ignoring duplicate reconnect for '{}' (already connected)",
                                     acct.config.label,
@@ -849,7 +869,7 @@ impl App {
                                 acct.config.label,
                                 acct.reconnect_attempts,
                             );
-                            acct.session = Some(session);
+                            acct.client = Some(client);
                             acct.reconnect_attempts = 0;
                             acct.last_error = None;
                             self.spawn_watcher_for(account_idx);

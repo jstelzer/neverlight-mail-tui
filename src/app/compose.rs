@@ -11,6 +11,9 @@ impl App {
             ComposeMode::New => {}
             ComposeMode::Reply => {
                 if let Some(msg) = self.messages.get(self.selected_message) {
+                    if let Some((_, account_id)) = self.account_for_message(msg) {
+                        state.account_id = Some(account_id);
+                    }
                     state.to = msg.from.clone();
                     state.subject = if msg.subject.starts_with("Re: ") {
                         msg.subject.clone()
@@ -36,6 +39,9 @@ impl App {
             }
             ComposeMode::Forward => {
                 if let Some(msg) = self.messages.get(self.selected_message) {
+                    if let Some((_, account_id)) = self.account_for_message(msg) {
+                        state.account_id = Some(account_id);
+                    }
                     state.subject = if msg.subject.starts_with("Fwd: ") {
                         msg.subject.clone()
                     } else {
@@ -67,27 +73,71 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        let acct_config = &self.active().config;
+        let account_idx = state
+            .account_id
+            .as_deref()
+            .and_then(|id| self.account_idx_by_id(id))
+            .unwrap_or(self.active_account);
+
+        let client = match self.accounts[account_idx].client.clone() {
+            Some(c) => c,
+            None => {
+                self.status = "No connection — cannot send".into();
+                return;
+            }
+        };
+
+        let acct_config = &self.accounts[account_idx].config;
         let from = acct_config
             .email_addresses
             .first()
             .cloned()
             .unwrap_or_else(|| acct_config.username.clone());
+        let to: Vec<String> = state
+            .to
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         let body_text = state.body.lines().join("\n");
-        let email = neverlight_mail_core::smtp::OutgoingEmail {
-            from,
-            to: state.to,
-            subject: state.subject,
-            body: body_text,
-            in_reply_to: state.in_reply_to,
-            references: state.references,
-            attachments: Vec::new(),
-        };
-        let smtp_config = acct_config.smtp.clone();
+
         let tx = self.bg_tx.clone();
         self.status = "Sending…".into();
         tokio::spawn(async move {
-            let result = neverlight_mail_core::smtp::send_email(&smtp_config, &email).await;
+            // Resolve identity for sending
+            let identities = neverlight_mail_core::submit::get_identities(&client)
+                .await
+                .unwrap_or_default();
+            let identity_id = identities
+                .first()
+                .map(|i| i.id.clone())
+                .unwrap_or_default();
+
+            // Find drafts and sent mailbox IDs
+            let folders = neverlight_mail_core::mailbox::fetch_all(&client)
+                .await
+                .unwrap_or_default();
+            let drafts_id = neverlight_mail_core::mailbox::find_by_role(&folders, "drafts")
+                .unwrap_or_default();
+            let sent_id = neverlight_mail_core::mailbox::find_by_role(&folders, "sent")
+                .unwrap_or_default();
+
+            let req = neverlight_mail_core::submit::SendRequest {
+                identity_id: &identity_id,
+                from: &from,
+                to: &to,
+                cc: &[],
+                subject: &state.subject,
+                text_body: &body_text,
+                html_body: None,
+                drafts_mailbox_id: &drafts_id,
+                sent_mailbox_id: &sent_id,
+            };
+
+            let result = neverlight_mail_core::submit::send(&client, &req)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
             let _ = tx.send(BgResult::SendResult(result));
         });
     }

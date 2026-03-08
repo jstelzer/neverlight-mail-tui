@@ -94,7 +94,7 @@ fn render_conn_info(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for (i, acct) in app.accounts.iter().enumerate() {
         let active = i == app.active_account;
-        let (symbol, style) = if acct.session.is_some() {
+        let (symbol, style) = if acct.client.is_some() {
             ("●", Style::default().fg(Color::Green))
         } else if acct.reconnect_attempts > 0 {
             ("↻", Style::default().fg(Color::Yellow))
@@ -102,10 +102,7 @@ fn render_conn_info(frame: &mut Frame, app: &App, area: Rect) {
             ("○", Style::default().fg(Color::Red))
         };
 
-        let mut spans = vec![
-            Span::styled(symbol, style),
-            Span::raw(" "),
-        ];
+        let mut spans = vec![Span::styled(symbol, style), Span::raw(" ")];
 
         let label_style = if active {
             Style::default().bold()
@@ -156,10 +153,10 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             let indent = "  ".repeat(m.thread_depth as usize);
             // Collapse indicator for thread roots
             let collapse = if m.thread_depth == 0 {
-                if let Some(tid) = m.thread_id {
-                    let size = app.thread_sizes.get(&tid).copied().unwrap_or(1);
+                if let Some(ref tid) = m.thread_id {
+                    let size = app.thread_sizes.get(tid).copied().unwrap_or(1);
                     if size > 1 {
-                        if app.collapsed_threads.contains(&tid) {
+                        if app.collapsed_threads.contains(tid) {
                             format!("[+{size}] ")
                         } else {
                             format!("[-{size}] ")

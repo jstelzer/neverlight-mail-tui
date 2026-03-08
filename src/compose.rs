@@ -19,6 +19,7 @@ pub enum ComposeField {
 }
 
 pub struct ComposeState {
+    pub account_id: Option<String>,
     pub to: String,
     pub subject: String,
     pub body: TextArea<'static>,
@@ -32,6 +33,7 @@ impl ComposeState {
         let mut body = TextArea::default();
         body.set_cursor_line_style(ratatui::style::Style::default());
         Self {
+            account_id: None,
             to: String::new(),
             subject: String::new(),
             body,
