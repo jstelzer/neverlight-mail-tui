@@ -2,7 +2,7 @@
 name = "neverlight-mail-tui"
 version = "0.0.1"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 description = "Terminal email client powered by neverlight-mail-core"
 repository = "https://github.com/jstelzer/neverlight-mail-tui"
 

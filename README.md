@@ -166,4 +166,4 @@ On iTerm2, inline image rendering uses OSC 1337 and may trigger a one-time permi
 
 ## License
 
-GPL-3.0-or-later
+MIT OR Apache-2.0
