@@ -108,19 +108,24 @@ impl App {
             let identities = neverlight_mail_core::submit::get_identities(&client)
                 .await
                 .unwrap_or_default();
-            let identity_id = identities
-                .first()
-                .map(|i| i.id.clone())
-                .unwrap_or_default();
+            let Some(identity) = neverlight_mail_core::submit::find_identity_for_address(&identities, &from) else {
+                let _ = tx.send(BgResult::SendResult(Err("No sender identity found".into())));
+                return;
+            };
+            let identity_id = identity.id.clone();
 
             // Find drafts and sent mailbox IDs
             let folders = neverlight_mail_core::mailbox::fetch_all(&client)
                 .await
                 .unwrap_or_default();
-            let drafts_id = neverlight_mail_core::mailbox::find_by_role(&folders, "drafts")
-                .unwrap_or_default();
-            let sent_id = neverlight_mail_core::mailbox::find_by_role(&folders, "sent")
-                .unwrap_or_default();
+            let Some(drafts_id) = neverlight_mail_core::mailbox::find_by_role(&folders, "drafts") else {
+                let _ = tx.send(BgResult::SendResult(Err("Drafts folder not found".into())));
+                return;
+            };
+            let Some(sent_id) = neverlight_mail_core::mailbox::find_by_role(&folders, "sent") else {
+                let _ = tx.send(BgResult::SendResult(Err("Sent folder not found".into())));
+                return;
+            };
 
             let req = neverlight_mail_core::submit::SendRequest {
                 identity_id: &identity_id,
