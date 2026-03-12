@@ -13,12 +13,9 @@ impl App {
         let cache = self.cache.clone();
         let account_id = self.active_account_id();
         let handle = tokio::spawn(async move {
-            let result = neverlight_mail_core::mailbox::fetch_all(&client)
+            let result = neverlight_mail_core::sync::sync_mailboxes(&client, &cache, &account_id)
                 .await
                 .map_err(|e| e.to_string());
-            if let Ok(ref folders) = result {
-                let _ = cache.save_folders(account_id, folders.clone()).await;
-            }
             let _ = tx.send(BgResult::Folders {
                 account_idx,
                 lane_epoch,
@@ -81,18 +78,14 @@ impl App {
         });
         self.register_lane_task(Lane::Folder, cache_handle);
 
-        // JMAP fetch (authoritative, overwrites cache)
+        // JMAP fetch (authoritative — sync_emails handles save + prune + state tokens)
         let jmap_mailbox_id = mailbox_id.clone();
         let jmap_handle = tokio::spawn(async move {
-            let result = neverlight_mail_core::email::query_and_get(&client, &jmap_mailbox_id, 200, 0)
-                .await
-                .map(|(msgs, _query_result)| msgs)
-                .map_err(|e| e.to_string());
-            if let Ok(ref msgs) = result {
-                let _ = cache
-                    .save_messages(account_id, mailbox_id.clone(), msgs.clone())
-                    .await;
-            }
+            let result = neverlight_mail_core::sync::sync_emails(
+                &client, &cache, &account_id, &jmap_mailbox_id, 200,
+            )
+            .await
+            .map_err(|e| e.to_string());
             let _ = tx.send(BgResult::Messages {
                 account_idx,
                 lane_epoch,

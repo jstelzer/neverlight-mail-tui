@@ -137,6 +137,8 @@ impl App {
                 html_body: None,
                 drafts_mailbox_id: &drafts_id,
                 sent_mailbox_id: &sent_id,
+                in_reply_to: None,
+                references: None,
             };
 
             let result = neverlight_mail_core::submit::send(&client, &req)
