@@ -187,7 +187,7 @@ impl App {
 
         let msg = self.messages.remove(idx);
         let email_id = msg.email_id.clone();
-        let source_mailbox_id = msg.mailbox_id.clone();
+        let source_mailbox_id = msg.context_mailbox_id.clone();
 
         // Adjust selection
         if self.selected_message >= self.messages.len() && !self.messages.is_empty() {

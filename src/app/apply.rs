@@ -1,5 +1,7 @@
 //! BgResult apply dispatcher — maps background task results to state updates.
 
+use std::sync::atomic::Ordering;
+
 use super::{body_error_indicates_stale_message, error_indicates_dead_session, App, BgResult, Focus, Lane, Phase};
 
 impl App {
@@ -67,6 +69,14 @@ impl App {
                 account_idx,
                 result,
             } => self.apply_reconnected(account_idx, result),
+            BgResult::BackfillProgress {
+                account_idx,
+                mailbox_id,
+                position,
+                total,
+                completed,
+            } => self.apply_backfill_progress(account_idx, mailbox_id, position, total, completed),
+            BgResult::BackfillComplete { account_idx } => self.apply_backfill_complete(account_idx),
         }
         if self.phase != Phase::Refreshing {
             self.clear_refresh_watchdog();
@@ -100,6 +110,11 @@ impl App {
                 let acct = &mut self.accounts[account_idx];
                 acct.folders = folders;
                 if !acct.folders.is_empty() {
+                    // Activate backfill after initial folder sync
+                    if !acct.backfill_active && acct.client.is_some() {
+                        acct.backfill_active = true;
+                        self.spawn_backfill(account_idx);
+                    }
                     self.spawn_load_messages();
                 }
             }
@@ -156,6 +171,10 @@ impl App {
                 let name = &self.active().folders[folder_idx].name;
                 self.status = format!("{name} — {} messages", msgs.len());
                 self.phase = Phase::Idle;
+                // Unpause backfill after head sync completes
+                if let Some(acct) = self.accounts.get(account_idx) {
+                    acct.backfill_pause.store(false, Ordering::Relaxed);
+                }
                 // Reconcile sidebar unread count from actual message flags
                 let unread = msgs.iter().filter(|m| !m.is_read).count() as u32;
                 if let Some(folder) = self.accounts[account_idx].folders.get_mut(folder_idx) {
@@ -466,6 +485,10 @@ impl App {
                 return;
             }
         }
+        // Pause backfill during head sync to avoid contention
+        if let Some(acct) = self.accounts.get(account_idx) {
+            acct.backfill_pause.store(true, Ordering::Relaxed);
+        }
         // Refresh the active account's current folder
         let is_active = account_idx == self.active_account;
         if is_active {
@@ -515,6 +538,33 @@ impl App {
             log::info!("Re-spawning push watcher for account {}", account_idx);
             self.spawn_watcher_for(account_idx);
         }
+    }
+
+    fn apply_backfill_progress(
+        &mut self,
+        account_idx: usize,
+        mailbox_id: String,
+        position: u32,
+        total: u32,
+        completed: bool,
+    ) {
+        let Some(acct) = self.accounts.get_mut(account_idx) else {
+            return;
+        };
+        if completed {
+            acct.backfill_progress.remove(&mailbox_id);
+        } else {
+            acct.backfill_progress.insert(mailbox_id, (position, total));
+        }
+    }
+
+    fn apply_backfill_complete(&mut self, account_idx: usize) {
+        log::info!("Backfill complete for account {}", account_idx);
+        let Some(acct) = self.accounts.get_mut(account_idx) else {
+            return;
+        };
+        acct.backfill_active = false;
+        acct.backfill_progress.clear();
     }
 
     fn apply_reconnected(

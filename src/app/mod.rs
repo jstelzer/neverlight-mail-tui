@@ -9,6 +9,8 @@ mod sync;
 mod watch;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::prelude::Rect;
@@ -124,6 +126,18 @@ pub enum BgResult {
         account_idx: usize,
         result: Result<JmapClient, String>,
     },
+    /// Backfill batch completed for a mailbox
+    BackfillProgress {
+        account_idx: usize,
+        mailbox_id: String,
+        position: u32,
+        total: u32,
+        completed: bool,
+    },
+    /// All mailboxes finished backfilling for an account
+    BackfillComplete {
+        account_idx: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +154,12 @@ pub struct AccountState {
     pub last_error: Option<String>,
     /// Monotonic generation counter for watcher identity.
     pub watch_generation: u64,
+    /// Per-mailbox backfill progress: mailbox_id → (position, total).
+    pub backfill_progress: HashMap<String, (u32, u32)>,
+    /// Whether backfill is active for this account.
+    pub backfill_active: bool,
+    /// Pause flag — set during head sync to avoid contention.
+    pub backfill_pause: Arc<AtomicBool>,
 }
 
 impl AccountState {
@@ -203,6 +223,8 @@ pub struct App {
     pub(super) account_lane_tasks: AccountLaneTasks,
     /// At most one delayed reconnect task per account.
     pub(super) reconnect_tasks: HashMap<usize, JoinHandle<()>>,
+    /// At most one backfill task per account.
+    pub(super) backfill_tasks: HashMap<usize, JoinHandle<()>>,
     pub diagnostics: Diagnostics,
 }
 
@@ -342,7 +364,7 @@ impl App {
     }
 
     pub(super) fn message_identity(msg: &MessageSummary) -> (&str, &str, &str) {
-        (&msg.account_id, &msg.mailbox_id, &msg.email_id)
+        (&msg.account_id, &msg.context_mailbox_id, &msg.email_id)
     }
 
     pub(super) fn selected_message_identity(&self) -> Option<(&str, &str, &str)> {
@@ -368,6 +390,9 @@ impl App {
                 reconnect_attempts: 0,
                 last_error: None,
                 watch_generation: 0,
+                backfill_progress: HashMap::new(),
+                backfill_active: false,
+                backfill_pause: Arc::new(AtomicBool::new(false)),
             };
             account_states.push(state);
         }
@@ -408,6 +433,7 @@ impl App {
             account_lane_epochs: AccountLaneEpochs::default(),
             account_lane_tasks: AccountLaneTasks::default(),
             reconnect_tasks: HashMap::new(),
+            backfill_tasks: HashMap::new(),
             diagnostics: Diagnostics::default(),
         };
 

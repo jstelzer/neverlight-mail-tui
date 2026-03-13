@@ -1,6 +1,115 @@
+use std::sync::atomic::Ordering;
+
 use super::{App, BgResult, Lane, Phase};
 
 impl App {
+    /// Start the background backfill task for a specific account.
+    pub(super) fn spawn_backfill(&mut self, account_idx: usize) {
+        // Cancel any existing backfill task for this account
+        if let Some(handle) = self.backfill_tasks.remove(&account_idx) {
+            handle.abort();
+        }
+
+        let acct = &self.accounts[account_idx];
+        let client = match &acct.client {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let cache = self.cache.clone();
+        let account_id = acct.config.id.clone();
+        let max_messages = acct.config.max_messages_per_mailbox;
+        let pause = acct.backfill_pause.clone();
+        let folder_mailbox_ids: Vec<String> =
+            acct.folders.iter().map(|f| f.mailbox_id.clone()).collect();
+        let tx = self.bg_tx.clone();
+        let page_size = neverlight_mail_core::email::DEFAULT_PAGE_SIZE;
+
+        let handle = tokio::spawn(async move {
+            let aid = account_id;
+            loop {
+                // Wait while paused (head sync in progress)
+                while pause.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+
+                // Get incomplete mailboxes from cache
+                let incomplete = match cache.list_backfill_progress(aid.clone()).await {
+                    Ok(list) => list,
+                    Err(e) => {
+                        log::warn!("backfill: failed to list progress: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        continue;
+                    }
+                };
+
+                // Build work list: incomplete + never-started mailboxes
+                let has_progress: std::collections::HashSet<String> =
+                    incomplete.iter().map(|p| p.mailbox_id.clone()).collect();
+                let mut work: Vec<String> =
+                    incomplete.into_iter().map(|p| p.mailbox_id).collect();
+
+                for mid in &folder_mailbox_ids {
+                    if !has_progress.contains(mid) {
+                        let progress = cache
+                            .get_backfill_progress(aid.clone(), mid.clone())
+                            .await
+                            .ok()
+                            .flatten();
+                        if progress.is_none() {
+                            work.push(mid.clone());
+                        }
+                    }
+                }
+
+                if work.is_empty() {
+                    let _ = tx.send(BgResult::BackfillComplete {
+                        account_idx,
+                    });
+                    return;
+                }
+
+                // Process one batch per mailbox
+                for mailbox_id in &work {
+                    if pause.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    match neverlight_mail_core::backfill::backfill_batch(
+                        &client,
+                        &cache,
+                        &aid,
+                        mailbox_id,
+                        page_size,
+                        max_messages,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            let _ = tx.send(BgResult::BackfillProgress {
+                                account_idx,
+                                mailbox_id: result.mailbox_id,
+                                position: result.position,
+                                total: result.total,
+                                completed: result.completed,
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "backfill: batch failed for mailbox {}: {}",
+                                mailbox_id,
+                                e
+                            );
+                        }
+                    }
+
+                    // Throttle between mailboxes
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        });
+        self.backfill_tasks.insert(account_idx, handle);
+    }
+
     pub(super) fn spawn_load_folders(&mut self) {
         let client = match self.active_client() {
             Some(c) => c,
@@ -109,7 +218,7 @@ impl App {
             }
         };
         let email_id = msg.email_id.clone();
-        let mailbox_id = msg.mailbox_id.clone();
+        let mailbox_id = msg.context_mailbox_id.clone();
         let (account_idx, account_id) = match self.account_for_message(&msg) {
             Some(account) => account,
             None => {

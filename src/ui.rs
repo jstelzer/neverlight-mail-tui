@@ -53,15 +53,20 @@ fn render_folders(frame: &mut Frame, app: &App, area: Rect) {
     let conn_area = chunks[1];
 
     // -- Folder list --
+    let acct = &app.accounts[app.active_account];
     let items: Vec<ListItem> = app
         .active_folders()
         .iter()
         .map(|f| {
-            let label = if f.unread_count > 0 {
+            let mut label = if f.unread_count > 0 {
                 format!("{} ({})", f.name, f.unread_count)
             } else {
                 f.name.clone()
             };
+            // Show backfill progress inline
+            if let Some(&(position, total)) = acct.backfill_progress.get(&f.mailbox_id) {
+                label.push_str(&format!(" \u{25CC} {}/{}", format_count(position), format_count(total)));
+            }
             ListItem::new(label)
         })
         .collect();
@@ -373,5 +378,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let status = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Yellow));
         frame.render_widget(status, area);
+    }
+}
+
+fn format_count(n: u32) -> String {
+    if n >= 1_000 {
+        format!("{},{:03}", n / 1_000, n % 1_000)
+    } else {
+        n.to_string()
     }
 }

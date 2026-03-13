@@ -10,7 +10,7 @@ use neverlight_mail_core::config::{
     AuthBackend, ConfigNeedsInput, FileAccountConfig, MultiAccountFileConfig,
     AccountCapabilities, new_account_id,
 };
-use neverlight_mail_core::oauth::OAuthRedirectHandler;
+use neverlight_mail_oauth::{AppInfo, OAuthRedirectHandler};
 use neverlight_mail_core::setup::{FieldId, SetupInput, SetupModel, SetupTransition};
 
 pub use neverlight_mail_core::setup::SetupOutcome as SetupResult;
@@ -113,15 +113,24 @@ fn run_oauth_flow(
     let rt = tokio::runtime::Runtime::new()?;
     let jmap_url_owned = jmap_url.to_string();
     let (flow, token_set) = rt.block_on(async move {
-        let redirect = neverlight_mail_core::oauth::LocalServerRedirect::bind().await
+        let redirect = neverlight_mail_oauth::LocalServerRedirect::bind("Neverlight Mail TUI").await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let redirect_uri = redirect.redirect_uri();
         eprintln!("Listening for redirect on {redirect_uri}");
 
-        let flow = neverlight_mail_core::oauth::OAuthFlow::discover_and_register(
+        let app_info = AppInfo {
+            client_name: "Neverlight Mail TUI".into(),
+            client_uri: "https://github.com/jstelzer/neverlight-mail-tui".into(),
+            software_id: "neverlight-mail-tui".into(),
+            software_version: env!("CARGO_PKG_VERSION").into(),
+            redirect_uri: redirect_uri.clone(),
+        };
+
+        let flow = neverlight_mail_oauth::OAuthFlow::discover_and_register(
             &jmap_url_owned,
-            &redirect_uri,
+            &app_info,
+            "urn:ietf:params:oauth:scope:mail",
         )
         .await
         .map_err(|e| anyhow::anyhow!("Discovery failed: {e}"))?;
@@ -177,6 +186,7 @@ fn run_oauth_flow(
         },
         email_addresses,
         capabilities: AccountCapabilities::default(),
+        max_messages_per_mailbox: None,
     };
 
     let mut multi = MultiAccountFileConfig::load()

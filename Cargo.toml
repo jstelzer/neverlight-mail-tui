@@ -9,6 +9,7 @@ repository = "https://github.com/jstelzer/neverlight-mail-tui"
 [dependencies]
 # Email engine
 neverlight-mail-core = { path = "../neverlight-mail-core" }
+neverlight-mail-oauth = { path = "../neverlight-mail-oauth" }
 
 # TUI framework
 ratatui = "0.30"
