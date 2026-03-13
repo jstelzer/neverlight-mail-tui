@@ -46,12 +46,31 @@ fn run_form(
 ) -> anyhow::Result<SetupResult> {
     let mut oauth_status: Option<String> = None;
 
+    // For reauth, jump straight to the OAuth flow
+    if model.is_reauth() {
+        let jmap_url = model.jmap_url.trim().to_string();
+        match run_oauth_flow(terminal, model, &jmap_url) {
+            Ok(()) => return Ok(SetupResult::Configured),
+            Err(e) => {
+                io::stdout().execute(EnterAlternateScreen)?;
+                terminal::enable_raw_mode()?;
+                oauth_status = Some(format!("OAuth re-auth failed: {e}"));
+                model.error = Some(format!("OAuth re-auth failed: {e}"));
+                // Fall through to form loop so user can cancel or retry
+            }
+        }
+    }
+
     loop {
         terminal.draw(|frame| render(frame, model, oauth_status.as_deref()))?;
 
         if let Event::Key(key) = event::read()? {
-            // Ctrl+O: start OAuth flow
-            if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Ctrl+O or Enter in reauth mode: start OAuth flow
+            let trigger_oauth =
+                (key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL))
+                || (key.code == KeyCode::Enter && model.is_reauth());
+
+            if trigger_oauth {
                 let jmap_url = model.jmap_url.trim().to_string();
                 if jmap_url.is_empty() || !jmap_url.starts_with("https://") {
                     model.error = Some("JMAP URL required for OAuth".into());
@@ -160,7 +179,9 @@ fn run_oauth_flow(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let account_id = new_account_id();
+    let account_id = model.account_id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(new_account_id);
 
     // Store refresh token in keyring
     let refresh_token_plaintext =
@@ -171,6 +192,23 @@ fn run_oauth_flow(
                 Some(token_set.refresh_token.clone())
             }
         };
+
+    let mut multi = MultiAccountFileConfig::load()
+        .ok()
+        .flatten()
+        .unwrap_or(MultiAccountFileConfig { accounts: Vec::new() });
+
+    // Preserve existing config fields (capabilities, email addresses, etc.) for reauth
+    let existing = multi.accounts.iter().find(|a| a.id == account_id);
+    let (caps, max_msgs, emails_resolved) = if let Some(ex) = existing {
+        (
+            ex.capabilities.clone(),
+            ex.max_messages_per_mailbox,
+            if email_addresses.is_empty() { ex.email_addresses.clone() } else { email_addresses },
+        )
+    } else {
+        (AccountCapabilities::default(), None, email_addresses)
+    };
 
     let fac = FileAccountConfig {
         id: account_id,
@@ -184,16 +222,16 @@ fn run_oauth_flow(
             token_endpoint: flow.token_endpoint().to_string(),
             refresh_token_plaintext,
         },
-        email_addresses,
-        capabilities: AccountCapabilities::default(),
-        max_messages_per_mailbox: None,
+        email_addresses: emails_resolved,
+        capabilities: caps,
+        max_messages_per_mailbox: max_msgs,
     };
 
-    let mut multi = MultiAccountFileConfig::load()
-        .ok()
-        .flatten()
-        .unwrap_or(MultiAccountFileConfig { accounts: Vec::new() });
-    multi.accounts.push(fac);
+    if let Some(pos) = multi.accounts.iter().position(|a| a.id == fac.id) {
+        multi.accounts[pos] = fac;
+    } else {
+        multi.accounts.push(fac);
+    }
     multi.save().map_err(|e| anyhow::anyhow!("Failed to save config: {e}"))?;
 
     eprintln!("Account configured. Starting mail client...");
@@ -212,8 +250,10 @@ fn render(frame: &mut Frame, model: &SetupModel, oauth_status: Option<&str>) {
         model.request,
         neverlight_mail_core::setup::SetupRequest::TokenOnly { .. }
     );
+    let is_reauth = model.is_reauth();
     let dialog_w = 60u16.min(area.width.saturating_sub(4));
-    let dialog_h = if is_token_only { 10u16 } else { 22u16 }.min(area.height.saturating_sub(2));
+    let dialog_h = if is_token_only || is_reauth { 12u16 } else { 22u16 }
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(dialog_w)) / 2;
     let y = (area.height.saturating_sub(dialog_h)) / 2;
     let dialog = Rect::new(x, y, dialog_w, dialog_h);
@@ -230,17 +270,38 @@ fn render(frame: &mut Frame, model: &SetupModel, oauth_status: Option<&str>) {
 
     let field_w = inner.width.saturating_sub(16) as usize;
 
-    // JMAP fields only
-    let text_fields: [(FieldId, &str); 5] = [
-        (FieldId::Label, "       Label"),
-        (FieldId::JmapUrl, "    JMAP URL"),
-        (FieldId::Username, "    Username"),
-        (FieldId::Token, "       Token"),
-        (FieldId::Email, "  From Email"),
-    ];
+    if is_reauth {
+        // Reauth: show read-only account info
+        lines.push(Line::from(Span::styled(
+            format!("  Account:  {}", model.label),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  Server:   {}", model.jmap_url),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  Username: {}", model.username),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Authorization expired. Press Enter to re-authorize.",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        // JMAP fields only
+        let text_fields: [(FieldId, &str); 5] = [
+            (FieldId::Label, "       Label"),
+            (FieldId::JmapUrl, "    JMAP URL"),
+            (FieldId::Username, "    Username"),
+            (FieldId::Token, "       Token"),
+            (FieldId::Email, "  From Email"),
+        ];
 
-    for (field, label) in &text_fields {
-        render_text_field(&mut lines, model, *field, label, field_w);
+        for (field, label) in &text_fields {
+            render_text_field(&mut lines, model, *field, label, field_w);
+        }
     }
 
     lines.push(Line::from(""));
@@ -264,16 +325,23 @@ fn render(frame: &mut Frame, model: &SetupModel, oauth_status: Option<&str>) {
     }
 
     // Help line
-    if !is_token_only {
+    if is_reauth {
         lines.push(Line::from(Span::styled(
-            "  Ctrl+O: sign in with browser (OAuth)",
-            Style::default().fg(Color::Cyan),
+            "  Enter: re-authorize  Esc: quit",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        if !is_token_only {
+            lines.push(Line::from(Span::styled(
+                "  Ctrl+O: sign in with browser (OAuth)",
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "  Tab: next  Shift-Tab: prev  Enter: save  Esc: quit",
+            Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        "  Tab: next  Shift-Tab: prev  Enter: save  Esc: quit",
-        Style::default().fg(Color::DarkGray),
-    )));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
