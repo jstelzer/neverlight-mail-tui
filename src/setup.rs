@@ -131,7 +131,7 @@ fn run_oauth_flow(
     // Run async OAuth flow in a one-shot runtime
     let rt = tokio::runtime::Runtime::new()?;
     let jmap_url_owned = jmap_url.to_string();
-    let (flow, token_set) = rt.block_on(async move {
+    let (flow, _access_token, refresh_token) = rt.block_on(async move {
         let redirect = neverlight_mail_oauth::LocalServerRedirect::bind("Neverlight Mail TUI").await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -161,10 +161,12 @@ fn run_oauth_flow(
         eprintln!("Waiting for authorization (complete the flow in your browser)...");
         let token_set = flow.authorize(&redirect).await
             .map_err(|e| anyhow::anyhow!("Authorization failed: {e}"))?;
+        let refresh_token = token_set.refresh_token
+            .ok_or_else(|| anyhow::anyhow!("OAuth server did not return a refresh token"))?;
 
         eprintln!("Authorization successful!");
 
-        anyhow::Ok((flow, token_set))
+        anyhow::Ok((flow, token_set.access_token, refresh_token))
     })?;
 
     // Save account config
@@ -185,11 +187,11 @@ fn run_oauth_flow(
 
     // Store refresh token in keyring
     let refresh_token_plaintext =
-        match neverlight_mail_core::keyring::set_oauth_refresh(&account_id, &token_set.refresh_token) {
+        match neverlight_mail_core::keyring::set_oauth_refresh(&account_id, &refresh_token) {
             Ok(()) => None,
             Err(e) => {
                 log::warn!("Keyring unavailable for OAuth ({}), using plaintext", e);
-                Some(token_set.refresh_token.clone())
+                Some(refresh_token.clone())
             }
         };
 
